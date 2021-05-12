@@ -2789,11 +2789,13 @@ class CLIFactory(object):
             'args': ('port', 'workers', 'workerclass', 'worker_timeout', 'hostname',
                      'pid', 'daemon', 'stdout', 'stderr', 'access_logfile',
                      'error_logfile', 'log_file', 'ssl_cert', 'ssl_key', 'debug'),
-        }, {
-            'func': resetdb,
-            'help': "Burn down and rebuild the metadata database",
-            'args': ('yes',),
-        }, {
+        },
+        #{
+        #    'func': resetdb,
+        #    'help': "Burn down and rebuild the metadata database",
+        #    'args': ('yes',),
+        #},
+        {
             'func': upgradedb,
             'help': "Upgrade the metadata database to latest version",
             'args': tuple(),
