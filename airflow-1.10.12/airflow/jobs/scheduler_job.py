@@ -495,8 +495,7 @@ class SchedulerJob(BaseJob):
             if isinstance(task.sla, timedelta):
                 dttm = dag.following_schedule(dttm)
                 while dttm < timezone.utcnow():
-                    following_schedule = dag.following_schedule(dttm)
-                    if following_schedule + task.sla < timezone.utcnow():
+                    if dttm + task.sla < timezone.utcnow():
                         session.merge(SlaMiss(
                             task_id=ti.task_id,
                             dag_id=ti.dag_id,
@@ -731,7 +730,7 @@ class SchedulerJob(BaseJob):
             if dag.schedule_interval == '@once':
                 period_end = next_run_date
             elif next_run_date:
-                period_end = dag.following_schedule(next_run_date)
+                period_end = next_run_date
 
             # Don't schedule a dag beyond its end_date (as specified by the dag param)
             if next_run_date and dag.end_date and next_run_date > dag.end_date:
