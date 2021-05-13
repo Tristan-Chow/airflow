@@ -338,6 +338,13 @@ def reap_process_group(pgid, log, sig=signal.SIGTERM,
             log.warning("process %s did not respond to SIGTERM. Trying SIGKILL", p)
 
         try:
+            subprocess.check_call(
+                ["sudo", "kill", "-9"] + [str(p.pid) for p in alive]
+            )
+        except Exception:
+            pass
+
+        try:
             signal_procs(signal.SIGKILL)
         except OSError as err:
             if err.errno != errno.ESRCH:
