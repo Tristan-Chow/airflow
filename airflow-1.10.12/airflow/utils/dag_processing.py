@@ -802,7 +802,8 @@ class DagFileProcessorManager(LoggingMixin):
         self.last_stat_print_time = timezone.datetime(2000, 1, 1)
         # TODO: Remove magic number
         self._zombie_query_interval = 10
-        self._zombies = []
+        self.mmg = multiprocessing.Manager()
+        self._zombies = self.mmg.dict()
         # How long to wait before timing out a process to parse a DAG file
         self._processor_timeout = processor_timeout
 
@@ -1334,7 +1335,9 @@ class DagFileProcessorManager(LoggingMixin):
                     sti.dag_id, sti.task_id, sti.execution_date.isoformat())
                 zombies.append(sti)
 
-            self._zombies = zombies
+            self._zombies.clear()
+            for sti in zombies:
+                self._zombies[(sti.dag_id, sti.task_id)] = sti
 
     def _kill_timed_out_processors(self):
         """

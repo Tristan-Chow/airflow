@@ -340,10 +340,13 @@ class DagBag(BaseDagBag, LoggingMixin):
         """
         from airflow.models.taskinstance import TaskInstance  # Avoid circular import
 
-        for zombie in zombies:
-            if zombie.dag_id in self.dags:
-                dag = self.dags[zombie.dag_id]
-                if zombie.task_id in dag.task_ids:
+        for zombie_tuple in zombies.keys():
+            if zombie_tuple[0] in self.dags:
+                dag = self.dags[zombie_tuple[0]]
+                if zombie_tuple[1] in dag.task_ids:
+                    zombie = zombies.get(zombie_tuple)
+                    if zombie is None:
+                        continue
                     task = dag.get_task(zombie.task_id)
                     ti = TaskInstance(task, zombie.execution_date)
                     # Get properties needed for failure handling from SimpleTaskInstance.
@@ -352,10 +355,40 @@ class DagBag(BaseDagBag, LoggingMixin):
                     ti.try_number = zombie.try_number
                     ti.state = zombie.state
                     ti.test_mode = self.UNIT_TEST_MODE
-                    ti.handle_failure("{} detected as zombie".format(ti),
-                                      ti.test_mode, ti.get_template_context())
-                    self.log.info('Marked zombie job %s as %s', ti, ti.state)
+                    if self.check_zombie(ti, session):
+                        ti.handle_failure("{} detected as zombie".format(ti),
+                                          ti.test_mode, ti.get_template_context())
+                        self.log.info('Marked zombie job %s as %s', ti, ti.state)
+                zombies.pop(zombie_tuple, None)
+
         session.commit()
+
+    def check_zombie(self, ti, session=None):
+        from airflow.models.taskinstance import TaskInstance as TI
+        from airflow.jobs.local_task_job import LocalTaskJob as LJ
+        from airflow.utils.state import State
+        from sqlalchemy import or_
+        limit_dttm = timezone.utcnow() - timedelta(
+            seconds=conf.getint('scheduler', 'scheduler_zombie_task_threshold'))
+
+        ti = (
+            session.query(TI)
+                .join(LJ, TI.job_id == LJ.id)
+                .filter(TI.dag_id == ti.dag_id,
+                        TI.task_id == ti.task_id,
+                        TI.execution_date == ti.execution_date,
+                        TI.state == State.RUNNING)
+                .filter(
+                or_(
+                    LJ.state != State.RUNNING,
+                    LJ.latest_heartbeat < limit_dttm,
+                )
+            ).one()
+        )
+        if ti:
+            return True
+        else:
+            return False
 
     def bag_dag(self, dag, parent_dag, root_dag):
         """
