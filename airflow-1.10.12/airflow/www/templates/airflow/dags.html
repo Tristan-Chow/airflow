@@ -446,8 +446,13 @@
                 return"cursor:pointer;"
           })
           .on('click', function(d, i) {
-              if (d.count > 0)
-                window.location = "{{ url_for('taskinstance.index_view') }}?flt1_dag_id_equals=" + dag_id + "&flt2_state_equals=" + d.state;
+              if (d.count > 0){
+                    if (d.state == null || d.state == "null"){
+                         window.location = "{{ url_for('taskinstance.index_view') }}?flt1_dag_id_equals=" + dag_id + "&flt3_state_empty=1";
+                    }else{
+                         window.location = "{{ url_for('taskinstance.index_view') }}?flt1_dag_id_equals=" + dag_id + "&flt2_state_equals=" + d.state;
+                    }
+              }
           })
           .on('mouseover', function(d, i) {
             if (d.count > 0) {
