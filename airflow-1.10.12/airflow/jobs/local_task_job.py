@@ -35,6 +35,7 @@ from airflow.utils.net import get_hostname
 from airflow.jobs.base_job import BaseJob
 from airflow.utils.state import State
 from airflow import event_action
+import time
 
 
 class LocalTaskJob(BaseJob):
@@ -80,14 +81,27 @@ class LocalTaskJob(BaseJob):
             raise AirflowException("LocalTaskJob received SIGTERM signal")
         signal.signal(signal.SIGTERM, signal_handler)
 
-        if not self.task_instance._check_and_change_state_before_execution(
-                mark_success=self.mark_success,
-                ignore_all_deps=self.ignore_all_deps,
-                ignore_depends_on_past=self.ignore_depends_on_past,
-                ignore_task_deps=self.ignore_task_deps,
-                ignore_ti_state=self.ignore_ti_state,
-                job_id=self.id,
-                pool=self.pool):
+        attempt = 0
+        while True:
+            try:
+                result = self.task_instance._check_and_change_state_before_execution(
+                    mark_success=self.mark_success,
+                    ignore_all_deps=self.ignore_all_deps,
+                    ignore_depends_on_past=self.ignore_depends_on_past,
+                    ignore_task_deps=self.ignore_task_deps,
+                    ignore_ti_state=self.ignore_ti_state,
+                    job_id=self.id,
+                    pool=self.pool)
+                break
+            except Exception as e:
+                if "transaction" in e.message and attempt < 10:
+                    attempt += 1
+                    self.log.error("check_and_change_state_before_execution error:{}".format(e.message))
+                    time.sleep(60)
+                    continue
+                raise e
+
+        if not result:
             self.log.info("Task is not able to be run")
             return
 

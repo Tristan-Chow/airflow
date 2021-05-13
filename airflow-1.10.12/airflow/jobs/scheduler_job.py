@@ -893,7 +893,7 @@ class SchedulerJob(BaseJob):
                 models.DagRun.state.is_(None)))
         # We need to do this for mysql as well because it can cause deadlocks
         # as discussed in https://issues.apache.org/jira/browse/AIRFLOW-2516
-        if self.using_sqlite or self.using_mysql:
+        if self.using_sqlite:
             tis_to_change = query \
                 .with_for_update() \
                 .all()
@@ -901,17 +901,18 @@ class SchedulerJob(BaseJob):
                 ti.set_state(new_state, session=session)
                 tis_changed += 1
         else:
-            subq = query.subquery()
-            tis_changed = session \
-                .query(models.TaskInstance) \
-                .filter(and_(
-                    models.TaskInstance.dag_id == subq.c.dag_id,
-                    models.TaskInstance.task_id == subq.c.task_id,
-                    models.TaskInstance.execution_date ==
-                    subq.c.execution_date)) \
-                .update({models.TaskInstance.state: new_state},
-                        synchronize_session=False)
-            session.commit()
+            tis = query.all()
+            tis_changed = len(tis)
+            if tis_changed > 0:
+                for ti in tis:
+                    session.query(models.TaskInstance) \
+                        .filter(and_(
+                            models.TaskInstance.dag_id == ti.dag_id,
+                            models.TaskInstance.task_id == ti.task_id,
+                            models.TaskInstance.execution_date == ti.execution_date)) \
+                        .update({models.TaskInstance.state: new_state},
+                                synchronize_session=False)
+                    session.commit()
 
         if tis_changed > 0:
             self.log.warning(
