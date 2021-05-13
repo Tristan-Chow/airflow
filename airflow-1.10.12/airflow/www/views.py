@@ -2882,6 +2882,19 @@ class DagRunModelView(ModelViewOnly):
         session.query(models.DagRun) \
             .filter(models.DagRun.id.in_(ids)) \
             .delete(synchronize_session='fetch')
+        for dr in deleted:
+            session.query(models.TaskInstance) \
+                .filter(models.TaskInstance.dag_id == dr.dag_id,
+                        models.TaskInstance.execution_date == dr.execution_date) \
+                .delete(synchronize_session='fetch')
+            session.query(models.TaskInstance) \
+                .filter(models.TaskInstance.dag_id.ilike(dr.dag_id + ".%"),
+                        models.TaskInstance.execution_date == dr.execution_date) \
+                .delete(synchronize_session='fetch')
+            session.query(models.DagRun) \
+                .filter(models.DagRun.dag_id.ilike(dr.dag_id + ".%"),
+                        models.DagRun.execution_date == dr.execution_date) \
+                .delete(synchronize_session='fetch')
         session.commit()
         dirty_ids = []
         for row in deleted:
