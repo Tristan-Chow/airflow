@@ -3118,6 +3118,8 @@ class TaskInstanceModelView(ModelViewOnly):
                 ti = session.query(TI).filter(TI.task_id == task_id,
                                               TI.dag_id == dag_id,
                                               TI.execution_date == execution_date).one()
+                if ti.state == State.UP_FOR_RESCHEDULE:
+                    ti.try_number = ti.next_try_number
                 ti.state = target_state
             session.commit()
             flash(

@@ -50,6 +50,11 @@ class ReadyToRescheduleDep(BaseTIDep):
                 reason="The task instance is not in State_UP_FOR_RESCHEDULE or NONE state.")
             return
 
+        if ti.state == State.NONE:
+            yield self._passing_status(
+                reason="The task instance is NONE state.")
+            return
+
         task_reschedules = TaskReschedule.find_for_task_instance(task_instance=ti)
         if not task_reschedules:
             yield self._passing_status(

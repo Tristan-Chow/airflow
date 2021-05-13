@@ -36,7 +36,7 @@ import pendulum
 import six
 from six.moves.urllib.parse import quote_plus
 from jinja2 import TemplateAssertionError, UndefinedError
-from sqlalchemy import Column, Float, Index, Integer, PickleType, String, func
+from sqlalchemy import Column, Float, Index, Integer, PickleType, String, func, desc
 from sqlalchemy.orm import reconstructor
 from sqlalchemy.orm.session import Session
 
@@ -1133,10 +1133,26 @@ class TaskInstance(Base, LoggingMixin):
         self.end_date = timezone.utcnow()
         self.set_duration()
 
-        # Log reschedule request
-        session.add(TaskReschedule(self.task, self.execution_date, self._try_number,
-                    actual_start_date, self.end_date,
-                    reschedule_exception.reschedule_date))
+        tr = session.query(TaskReschedule) \
+            .filter(TaskReschedule.dag_id == self.dag_id,
+                    TaskReschedule.task_id == self.task_id,
+                    TaskReschedule.execution_date == self.execution_date,
+                    TaskReschedule.try_number == self._try_number
+                    ) \
+            .order_by(desc(TaskReschedule.id)) \
+            .limit(1) \
+            .first()
+
+        if not tr:
+            # Log reschedule request
+            session.add(TaskReschedule(self.task, self.execution_date, self._try_number,
+                                       actual_start_date, self.end_date,
+                                       reschedule_exception.reschedule_date))
+        else:
+            tr.set_end_date(self.end_date)
+            tr.set_duration((self.end_date - actual_start_date).total_seconds())
+            tr.set_reschedule_date(reschedule_exception.reschedule_date)
+            session.merge(tr)
 
         # set state
         self.state = State.UP_FOR_RESCHEDULE
@@ -1148,6 +1164,7 @@ class TaskInstance(Base, LoggingMixin):
         session.merge(self)
         session.commit()
         self.log.info('Rescheduling task, marking task as UP_FOR_RESCHEDULE')
+        self.log.info('Rschedule date: %s', reschedule_exception.reschedule_date)
 
     @provide_session
     def handle_failure(self, error, test_mode=None, context=None, force_fail=False, session=None):

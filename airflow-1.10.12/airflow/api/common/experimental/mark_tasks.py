@@ -120,6 +120,8 @@ def set_state(
             qry_sub_dag = all_subdag_tasks_query(sub_dag_run_ids, session, state, confirmed_dates)
             tis_altered += qry_sub_dag.with_for_update().all()
         for task_instance in tis_altered:
+            if task_instance.state == State.UP_FOR_RESCHEDULE:
+                task_instance.try_number = task_instance.next_try_number
             task_instance.state = state
     else:
         tis_altered = qry_dag.all()

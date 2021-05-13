@@ -83,3 +83,12 @@ class TaskReschedule(Base):
             .order_by(asc(TR.id))
             .all()
         )
+
+    def set_end_date(self, end_date):
+        self.end_date = end_date
+
+    def set_duration(self, duration):
+        self.duration = duration
+
+    def set_reschedule_date(self, reschedule_date):
+        self.reschedule_date = reschedule_date
