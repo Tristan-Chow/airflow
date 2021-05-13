@@ -50,6 +50,9 @@ DEFAULT_CELERY_CONFIG = {
     'worker_concurrency': conf.getint('celery', 'WORKER_CONCURRENCY'),
 }
 
+if 'sentinel://' in DEFAULT_CELERY_CONFIG['result_backend']:
+    DEFAULT_CELERY_CONFIG['result_backend_transport_options'] = broker_transport_options
+
 celery_ssl_active = False
 try:
     celery_ssl_active = conf.getboolean('celery', 'SSL_ACTIVE')
