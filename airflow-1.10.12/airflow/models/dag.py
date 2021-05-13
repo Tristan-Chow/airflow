@@ -293,6 +293,12 @@ class DAG(BaseDag, LoggingMixin):
                     timezone.parse(self.default_args['end_date'], timezone=self.timezone)
                 )
 
+        if not start_date and 'start_date' in self.default_args and self.default_args['start_date']:
+            start_date = self.default_args['start_date']
+
+        if not end_date and 'end_date' in self.default_args and self.default_args['end_date']:
+            end_date = self.default_args['end_date']
+
         self.start_date = timezone.convert_to_utc(start_date)
         self.end_date = timezone.convert_to_utc(end_date)
 
