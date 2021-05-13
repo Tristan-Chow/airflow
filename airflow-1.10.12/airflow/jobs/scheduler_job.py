@@ -60,6 +60,7 @@ from airflow.utils.email import get_email_address_list, send_email
 from airflow.utils.mixins import MultiprocessingStartMethodMixin
 from airflow.utils.log.logging_mixin import LoggingMixin, StreamLogWriter, set_context
 from airflow.utils.state import State
+from airflow import event_action
 
 
 class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingStartMethodMixin):
@@ -596,7 +597,52 @@ class SchedulerJob(BaseJob):
                         sla.email_sent = True
                     sla.notification_sent = True
                     session.merge(sla)
+
+                    try:
+                        task = dag.get_task(sla.task_id)
+                        ti = [t for t in blocking_tis if t.task_id == sla.task_id][0]
+                        event_action.do_ti_action(event_action.TI_SLAS, task, ti)
+                    except Exception as e:
+                        self.log.error('Executing event action error for %s.%s.%s sla miss event',
+                                       dag.dag_id, sla.task_id, sla.execution_date)
+                        self.log.exception(e)
+
             session.commit()
+
+    @provide_session
+    def manage_dag_notify_slas(self, dag, session=None):
+        if dag.notify_sla is None:
+            self.log.info("Skip dag notify slas miss.")
+            return
+
+        latest_dr = dag.get_last_dagrun(session=session)
+
+        if latest_dr is None or latest_dr.state == State.SUCCESS:
+            return
+
+        mt = latest_dr.execution_date + dag.notify_sla
+        now = timezone.utcnow()
+        if now < mt:
+            return
+
+        DS = models.DagSlaMiss
+        dsla = session.query(DS).filter(DS.dag_id == dag.dag_id,
+                                        DS.execution_date == latest_dr.execution_date,
+                                        ~DS.notification_sent).first()
+
+        if dsla is not None:
+            return
+
+        event_action.do_dr_action(event_action.DR_SLAS, dag, latest_dr, extend_msg={
+            'msg': '{}.{} sla miss. sla: {}'.format(dag.dag_id, latest_dr.execution_date, str(dag.notify_sla))
+        })
+
+        session.merge(DS(dag_id=dag.dag_id,
+                         execution_date=latest_dr.execution_date,
+                         notification_sent=True,
+                         timestamp=timezone.utcnow()))
+
+        session.commit()
 
     @staticmethod
     def update_import_errors(session, dagbag):
@@ -1663,6 +1709,14 @@ class SchedulerJob(BaseJob):
                     ti.start_date = ti.end_date = timezone.utcnow()
                     ti.duration = 0
 
+                    try:
+                        event = event_action.TI_SUCCESS
+                        event_action.do_ti_action(event, ti.task, self)
+                    except Exception as e:
+                        self.log.error('Executing event action error for %s.%s.%s',
+                                       ti.dag_id, ti.task_id, ti.execution_date)
+                        self.log.exception(e)
+
             # Also save this task instance to the DB.
             self.log.info("Creating / updating %s in ORM", ti)
             session.merge(ti)
@@ -1678,6 +1732,12 @@ class SchedulerJob(BaseJob):
             dagbag.kill_zombies(zombies)
         except Exception:
             self.log.exception("Error killing zombies!")
+
+        for dag in dagbag.dags.values():
+            try:
+                self.manage_dag_notify_slas(dag)
+            except Exception:
+                self.log.exception("Error manage dag notify_slas for %s!", dag.dag_id)
 
         return simple_dags, len(dagbag.import_errors)
 

@@ -160,6 +160,18 @@ def upgrade():
             column_name="execution_date",
             type_=mysql.TIMESTAMP(fsp=6),
         )
+
+        op.alter_column(
+            table_name="dag_sla_miss",
+            column_name="execution_date",
+            type_=mysql.TIMESTAMP(fsp=6),
+            nullable=False,
+        )
+        op.alter_column(
+            table_name="dag_sla_miss",
+            column_name="timestamp",
+            type_=mysql.TIMESTAMP(fsp=6),
+        )
     else:
         # sqlite and mssql datetime are fine as is.  Therefore, not converting
         if conn.dialect.name in ("sqlite", "mssql"):
@@ -304,6 +316,18 @@ def upgrade():
             type_=sa.TIMESTAMP(timezone=True),
         )
 
+        op.alter_column(
+            table_name="dag_sla_miss",
+            column_name="execution_date",
+            type_=sa.TIMESTAMP(timezone=True),
+            nullable=False,
+        )
+        op.alter_column(
+            table_name="dag_sla_miss",
+            column_name="timestamp",
+            type_=sa.TIMESTAMP(timezone=True),
+        )
+
 
 def downgrade():
     conn = op.get_bind()
@@ -420,6 +444,14 @@ def downgrade():
         op.alter_column(
             table_name="xcom", column_name="execution_date", type_=mysql.DATETIME(fsp=6)
         )
+
+        op.alter_column(
+            table_name="dag_sla_miss", column_name="execution_date", type_=mysql.DATETIME(fsp=6), nullable=False,
+        )
+        op.alter_column(
+            table_name="dag_sla_miss", column_name="timestamp", type_=mysql.DATETIME(fsp=6)
+        )
+
     else:
         if conn.dialect.name in ("sqlite", "mssql"):
             return
@@ -511,4 +543,11 @@ def downgrade():
         op.alter_column(table_name="xcom", column_name="timestamp", type_=sa.DateTime())
         op.alter_column(
             table_name="xcom", column_name="execution_date", type_=sa.DateTime()
+        )
+
+        op.alter_column(
+            table_name="dag_sla_miss", column_name="execution_date", type_=sa.DateTime(),nullable=False,
+        )
+        op.alter_column(
+            table_name="dag_sla_miss", column_name="timestamp", type_=sa.DateTime()
         )

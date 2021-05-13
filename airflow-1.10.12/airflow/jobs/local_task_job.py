@@ -34,6 +34,7 @@ from airflow.utils.db import provide_session
 from airflow.utils.net import get_hostname
 from airflow.jobs.base_job import BaseJob
 from airflow.utils.state import State
+from airflow import event_action
 
 
 class LocalTaskJob(BaseJob):
@@ -95,6 +96,11 @@ class LocalTaskJob(BaseJob):
 
             heartbeat_time_limit = conf.getint('scheduler',
                                                'scheduler_zombie_task_threshold')
+
+            notify_execution_sla = self.task_instance.task.notify_execution_sla
+            send_execution_warning = notify_execution_sla is not None
+            start_time = timezone.utcnow()
+
             while True:
                 # Monitor the task to see if it's done
                 return_code = self.task_runner.return_code()
@@ -115,6 +121,20 @@ class LocalTaskJob(BaseJob):
                                            "exceeded limit ({}s)."
                                            .format(time_since_last_heartbeat,
                                                    heartbeat_time_limit))
+
+                try:
+                    if send_execution_warning:
+                        if timezone.utcnow() >= start_time + notify_execution_sla:
+                            extend_msg = {'reason': "{} start execute at {}, execution time is over {}".format(
+                                self.task_instance, start_time, notify_execution_sla)}
+                            event_action.do_ti_action(event_action.TI_EXECUTION_SLA,
+                                                      self.task_instance.task, self.task_instance,
+                                                      extend_msg=extend_msg)
+                            send_execution_warning = False
+                except Exception as e:
+                    self.log.error('Executing event action error for %s.%s.%s',
+                                   self.task_instance.dag_id, self.task_instance.task_id, self.task_instance.execution_date)
+                    self.log.exception(e)
         finally:
             self.on_kill()
 
@@ -164,5 +184,17 @@ class LocalTaskJob(BaseJob):
             if ti.state == State.SUCCESS and ti.task.on_success_callback:
                 context = ti.get_template_context()
                 ti.task.on_success_callback(context)
+
+            try:
+                event = event_action.ti_state_map.get(ti.state, None)
+                if event is not None:
+                    event_action.do_ti_action(event, ti.task, ti,
+                                              extend_msg={'reason': 'State of this instance '
+                                                                    'has been externally set to ' + ti.state})
+            except Exception as e:
+                self.log.error('Executing event action error for %s.%s.%s',
+                               ti.dag_id, ti.task_id, ti.execution_date)
+                self.log.exception(e)
+
             self.task_runner.terminate()
             self.terminating = True

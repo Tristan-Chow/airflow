@@ -56,6 +56,7 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.operator_resources import Resources
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.weight_rule import WeightRule
+from airflow import event_action
 
 
 @functools.total_ordering
@@ -324,6 +325,9 @@ class BaseOperator(LoggingMixin):
         do_xcom_push=True,  # type: bool
         inlets=None,  # type: Optional[Dict]
         outlets=None,  # type: Optional[Dict]
+        notify_id=None,  # type: Optional[str]
+        notify_events=None,  # type: Optional[List[str]] | str
+        notify_execution_sla=None,  # type: Optional[timedelta]
         *args,
         **kwargs
     ):
@@ -448,6 +452,23 @@ class BaseOperator(LoggingMixin):
 
         if outlets:
             self._outlets.update(outlets)
+
+        self.notify_id = notify_id
+        if self.notify_id is None:
+            self.notify_id = dag.notify_id
+        self.notify_events = None
+        self.notify_execution_sla = None
+        if isinstance(notify_events, six.string_types):
+            self.notify_events = set(notify_events.split(","))
+        elif isinstance(notify_events, list):
+            self.notify_events = set(notify_events)
+        else:
+            self.notify_events = set()
+        if isinstance(notify_execution_sla, timedelta) and notify_execution_sla > timedelta(minutes=0):
+            self.notify_execution_sla = notify_execution_sla
+            self.notify_events.add(event_action.TI_EXECUTION_SLA)
+        elif event_action.TI_EXECUTION_SLA in self.notify_events:
+            self.notify_events.remove(event_action.TI_EXECUTION_SLA)
 
     def __eq__(self, other):
         if (type(self) == type(other) and

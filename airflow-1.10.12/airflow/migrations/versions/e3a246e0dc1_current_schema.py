@@ -259,6 +259,15 @@ def upgrade():
             sa.Column('dag_id', sa.String(length=250), nullable=False),
             sa.PrimaryKeyConstraint('id')
         )
+    if 'dag_sla_miss' not in tables:
+        op.create_table(
+            'dag_sla_miss',
+            sa.Column('dag_id', sa.String(length=250), nullable=False),
+            sa.Column('execution_date', sa.DateTime(), nullable=False),
+            sa.Column('notification_sent', sa.Boolean(), nullable=True),
+            sa.Column('timestamp', sa.DateTime(), nullable=True),
+            sa.PrimaryKeyConstraint('dag_id', 'execution_date')
+        )
 
 
 def downgrade():
@@ -281,3 +290,4 @@ def downgrade():
     op.drop_table('dag')
     op.drop_table('connection')
     op.drop_table('xcom')
+    op.drop_table('dag_sla_miss')

@@ -66,6 +66,7 @@ from airflow.utils.net import get_hostname
 from airflow.utils.sqlalchemy import UtcDateTime
 from airflow.utils.state import State
 from airflow.utils.timeout import timeout
+from airflow import event_action
 
 
 def clear_task_instances(tis,
@@ -1074,6 +1075,14 @@ class TaskInstance(Base, LoggingMixin):
             session.merge(self)
         session.commit()
 
+        try:
+            event = event_action.TI_SUCCESS
+            event_action.do_ti_action(event, task, self, context)
+        except Exception as e:
+            self.log.error('Executing event action error for %s.%s.%s',
+                           self.dag_id, self.task_id, self.execution_date)
+            self.log.exception(e)
+
     @provide_session
     def run(
             self,
@@ -1211,6 +1220,15 @@ class TaskInstance(Base, LoggingMixin):
         if not test_mode:
             session.merge(self)
         session.commit()
+
+        try:
+            event = event_action.TI_FAILED if force_fail or not self.is_eligible_to_retry() \
+                else event_action.TI_RETRY
+            event_action.do_ti_action(event, task, self, context)
+        except Exception as e:
+            self.log.error('Executing event action error for %s.%s.%s',
+                           self.dag_id, self.task_id, self.execution_date)
+            self.log.exception(e)
 
     def is_eligible_to_retry(self):
         """Is task instance is eligible for retry"""

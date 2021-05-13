@@ -63,6 +63,7 @@ from airflow.utils.helpers import validate_key
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.sqlalchemy import UtcDateTime, Interval
 from airflow.utils.state import State
+from airflow import event_action
 
 if TYPE_CHECKING:
     from airflow.models.baseoperator import BaseOperator  # Avoid circular dependency
@@ -244,6 +245,9 @@ class DAG(BaseDag, LoggingMixin):
         is_paused_upon_creation=None,  # type: Optional[bool]
         jinja_environment_kwargs=None,  # type: Optional[Dict]
         tags=None,  # type: Optional[List[str]]
+        notify_id=None,  # type: Optional[str]
+        notify_events=None,  # type: Optional[List[str]]
+        notify_sla=None,  # type: Optional[timedelta]
     ):
         self.user_defined_macros = user_defined_macros
         self.user_defined_filters = user_defined_filters
@@ -329,6 +333,21 @@ class DAG(BaseDag, LoggingMixin):
 
         self.jinja_environment_kwargs = jinja_environment_kwargs
         self.tags = tags
+
+        self.notify_id = notify_id
+        self.notify_events = None
+        self.notify_sla = None
+        if isinstance(notify_events, six.string_types):
+            self.notify_events = set(notify_events.split(","))
+        elif isinstance(notify_events, list):
+            self.notify_events = set(notify_events)
+        else:
+            self.notify_events = set()
+        if isinstance(notify_sla, timedelta) and notify_sla > timedelta(minutes=0):
+            self.notify_sla = notify_sla
+            self.notify_events.add(event_action.DR_SLAS)
+        elif event_action.DR_SLAS in self.notify_events:
+            self.notify_events.remove(event_action.DR_SLAS)
 
     def __repr__(self):
         return "<DAG: {self.dag_id}>".format(self=self)
@@ -687,6 +706,13 @@ class DAG(BaseDag, LoggingMixin):
             context = ti.get_template_context(session=session)
             context.update({'reason': reason})
             callback(context)
+
+        try:
+            event = event_action.DR_SUCCESS if success else event_action.DR_FAILED
+            event_action.do_dr_action(event, self, dagrun, extend_msg={'reason': reason})
+        except Exception as e:
+            self.log.error('Executing event action error for %s', self.dag_id)
+            self.log.exception(e)
 
     def get_active_runs(self):
         """
