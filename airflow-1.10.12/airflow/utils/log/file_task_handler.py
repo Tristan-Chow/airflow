@@ -27,6 +27,7 @@ from airflow.configuration import conf
 from airflow.configuration import AirflowConfigException
 from airflow.utils.file import mkdirs
 from airflow.utils.helpers import parse_template_string
+import socket
 
 
 class FileTaskHandler(logging.Handler):
@@ -100,13 +101,13 @@ class FileTaskHandler(logging.Handler):
 
         log = ""
 
-        if os.path.exists(location):
+        if os.path.exists(location) and ti.hostname == socket.gethostname():
             try:
                 with open(location) as file:
-                    log += "*** Reading local file: {}\n".format(location)
+                    log += "*** Reading local file: {} in {}\n".format(location, ti.hostname)
                     log += "".join(file.readlines())
             except Exception as e:
-                log = "*** Failed to load local log file: {}\n".format(location)
+                log = "*** Failed to load local log file: {} in {}\n".format(location, ti.hostname)
                 log += "*** {}\n".format(str(e))
         elif conf.get('core', 'executor') == 'KubernetesExecutor':
             log += '*** Trying to get logs (last 100 lines) from worker pod {} ***\n\n'\
@@ -133,30 +134,33 @@ class FileTaskHandler(logging.Handler):
                     ti.hostname, str(f)
                 )
         else:
-            url = os.path.join(
-                "http://{ti.hostname}:{worker_log_server_port}/log", log_relative_path
-            ).format(
-                ti=ti,
-                worker_log_server_port=conf.get('celery', 'WORKER_LOG_SERVER_PORT')
-            )
-            log += "*** Log file does not exist: {}\n".format(location)
-            log += "*** Fetching from: {}\n".format(url)
-            try:
-                timeout = None  # No timeout
+            worker_list = [ti.hostname]
+            worker_list.extend(conf.get('webserver', 'task_log_servers').split(","))
+            for hostname in worker_list:
+                url = os.path.join(
+                    "http://{hostname}:{worker_log_server_port}/log", log_relative_path
+                ).format(
+                    hostname=hostname,
+                    worker_log_server_port=conf.get('celery', 'WORKER_LOG_SERVER_PORT')
+                )
+                log += "*** Fetching from: {}\n".format(url)
                 try:
-                    timeout = conf.getint('webserver', 'log_fetch_timeout_sec')
-                except (AirflowConfigException, ValueError):
-                    pass
+                    timeout = None  # No timeout
+                    try:
+                        timeout = conf.getint('webserver', 'log_fetch_timeout_sec')
+                    except (AirflowConfigException, ValueError):
+                        pass
 
-                response = requests.get(url, timeout=timeout)
-                response.encoding = "utf-8"
+                    response = requests.get(url, timeout=timeout)
+                    response.encoding = "utf-8"
 
-                # Check if the resource was properly fetched
-                response.raise_for_status()
+                    # Check if the resource was properly fetched
+                    response.raise_for_status()
 
-                log += '\n' + response.text
-            except Exception as e:
-                log += "*** Failed to fetch log file from worker. {}\n".format(str(e))
+                    log += '\n' + response.text
+                    break
+                except Exception as e:
+                    log += "*** Failed to fetch log file from worker. {}\n".format(str(e))
 
         return log, {'end_of_log': True}
 
