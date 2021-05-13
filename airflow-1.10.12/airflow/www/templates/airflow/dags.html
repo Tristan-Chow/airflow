@@ -384,14 +384,14 @@
           .duration(500)
           .delay(function(d, i){return i*50;})
           .style("opacity", 1);
-        d3.select("#loading").remove();
       }
 
-      d3.json("{{ url_for('airflow.dag_stats') }}", function(error, json) {
+      d3.json("{{ url_for('airflow.dag_stats') }}?dag_ids=" + encoded_dag_ids.join(','), function(error, json) {
         for(var dag_id in json) {
             states = json[dag_id];
             drawDagStatsForDag(dag_id, states);
         }
+        d3.select("#loading").remove();
         $("#pause_header").tooltip();
         $("#statuses_info").tooltip();
 
@@ -473,7 +473,6 @@
           .duration(500)
           .delay(function(d, i){return i*50;})
           .style("opacity", 1);
-        d3.select("#loading").remove();
       }
 
       d3.json("{{ url_for('airflow.task_stats') }}?dag_ids=" + (encoded_dag_ids.join(',')), function(error, json) {
@@ -481,6 +480,7 @@
             states = json[dag_id];
             drawTaskStatsForDag(dag_id, states);
         }
+        d3.select("#loading").remove();
         $("#pause_header").tooltip();
         $("#statuses_info").tooltip();
 

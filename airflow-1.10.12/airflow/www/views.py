@@ -590,15 +590,21 @@ class Airflow(AirflowViewMixin, BaseView):
     @provide_session
     def dag_stats(self, session=None):
         dr = models.DagRun
-        dm = models.DagModel
-        dag_ids = session.query(dm.dag_id)
+
+        selected_dag_ids = {
+            unquote(dag_id) for dag_id in request.args.get('dag_ids', '').split(',') if dag_id
+        }
+
+        if not selected_dag_ids:
+            return wwwutils.json_response({})
 
         dag_state_stats = (
-            session.query(dr.dag_id, dr.state, sqla.func.count(dr.state)).group_by(dr.dag_id, dr.state)
+            session.query(dr.dag_id, dr.state, sqla.func.count(dr.state)).filter(
+                dr.dag_id.in_(selected_dag_ids)).group_by(dr.dag_id, dr.state)
         )
 
         data = {}
-        for (dag_id, ) in dag_ids:
+        for dag_id in selected_dag_ids:
             data[dag_id] = {}
         for dag_id, state, count in dag_state_stats:
             if dag_id not in data:
@@ -628,6 +634,9 @@ class Airflow(AirflowViewMixin, BaseView):
         selected_dag_ids = {
             unquote(dag_id) for dag_id in request.args.get('dag_ids', '').split(',') if dag_id
         }
+
+        if not selected_dag_ids:
+            return wwwutils.json_response({})
 
         LastDagRun = (
             session.query(DagRun.dag_id, sqla.func.max(DagRun.execution_date).label('execution_date'))
