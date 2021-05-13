@@ -471,7 +471,7 @@ class TaskInstance(Base, LoggingMixin):
             TI.execution_date == self.execution_date)
 
         if lock_for_update:
-            ti = qry.with_for_update().first()
+            ti = qry.with_for_update().populate_existing().first()
         else:
             ti = qry.first()
         if ti:
