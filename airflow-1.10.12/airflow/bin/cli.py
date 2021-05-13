@@ -532,7 +532,7 @@ def run(args, dag=None):
     # behind multiple open sleeping connections while heartbeating, which could
     # easily exceed the database connection limit when
     # processing hundreds of simultaneous tasks.
-    settings.configure_orm(disable_connection_pool=True)
+    settings.configure_orm(disable_connection_pool=True, dispose_last_orm=True)
 
     if not args.pickle and not dag:
         dag = get_dag(args)

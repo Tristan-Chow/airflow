@@ -229,7 +229,9 @@ def configure_vars():
     )
 
 
-def configure_orm(disable_connection_pool=False):
+def configure_orm(disable_connection_pool=False, dispose_last_orm=False):
+    if dispose_last_orm:
+        dispose_orm()
     log.debug("Setting up DB connection pool (PID %s)" % os.getpid())
     global engine
     global Session
