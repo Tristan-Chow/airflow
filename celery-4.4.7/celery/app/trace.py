@@ -503,6 +503,14 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                             state, retval, uuid, args, kwargs, None,
                         )
             finally:
+                if backend.__class__.__name__ in \
+                    ["SentinelBackend", "RedisBackend"]:
+                    try:
+                        getattr(backend, 'client', None)\
+                            .connection_pool.disconnect()
+                    except Exception:
+                        pass
+
                 try:
                     if postrun_receivers:
                         send_postrun(sender=task, task_id=uuid, task=task,
