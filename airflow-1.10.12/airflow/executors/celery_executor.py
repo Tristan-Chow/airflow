@@ -39,6 +39,9 @@ from airflow.exceptions import AirflowException
 from airflow.executors.base_executor import BaseExecutor
 from airflow.utils.module_loading import import_string
 from airflow.utils.timeout import timeout
+from kombu.utils.uuid import uuid
+import socket
+from datetime import datetime
 
 log = logging.getLogger(__name__)
 
@@ -122,11 +125,15 @@ def fetch_celery_task_state(celery_task):
     return res
 
 
+short_hostname = socket.gethostname().split(".")[0]
+
+
 def send_task_to_executor(task_tuple):
     key, simple_ti, command, queue, task = task_tuple
     try:
+        task_id = short_hostname + "-" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid()
         with timeout(seconds=OPERATION_TIMEOUT):
-            result = task.apply_async(args=[command], queue=queue)
+            result = task.apply_async(args=[command], queue=queue, task_id=task_id)
     except Exception as e:
         exception_traceback = "Celery Task ID: {}\n{}".format(key,
                                                               traceback.format_exc())
@@ -242,6 +249,7 @@ class CeleryExecutor(BaseExecutor):
                     self.running[key] = command
                     self.tasks[key] = result
                     self.last_state[key] = celery_states.PENDING
+                    self.event_buffer.pop(key, None)
 
     def sync(self):
         num_processes = min(len(self.tasks), self._sync_parallelism)
