@@ -67,6 +67,7 @@ from airflow.utils.sqlalchemy import UtcDateTime
 from airflow.utils.state import State
 from airflow.utils.timeout import timeout
 from airflow import event_action
+from airflow.api.client.job_client import job_client
 
 
 def clear_task_instances(tis,
@@ -1614,3 +1615,9 @@ class TaskInstance(Base, LoggingMixin):
         """
         self.raw = raw
         self._set_context(self)
+
+    def refresh_from_http(self):
+        """
+        Refreshes the task instance from RestAPI
+        """
+        job_client.get_task_info(self)

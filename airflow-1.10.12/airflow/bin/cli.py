@@ -1221,9 +1221,228 @@ def scheduler(args):
         job.run()
 
 
+def job_serve_app():
+    import flask
+    import pendulum
+    from airflow.utils.db import provide_session
+    from airflow.models import TaskInstance
+    from airflow.jobs.base_job import BaseJob
+    from airflow.utils import timezone
+    from flask import jsonify, request
+    tz = conf.get("core", "default_timezone")
+
+    flask_app = flask.Flask(__name__)
+
+    @flask_app.route('/test')
+    def test():
+        return get_hostname() + '-' + str(os.getpid())
+
+    @provide_session
+    def new_get_task_instance(dag_id, task_id, execution_date, session=None):
+        TI = TaskInstance
+        qry = session.query(TI).filter(
+            TI.dag_id == dag_id,
+            TI.task_id == task_id,
+            TI.execution_date == execution_date)
+
+        return qry.first()
+
+    @flask_app.route(
+        '/api/experimental/new_dags/<string:dag_id>/dag_runs/<string:execution_date>/tasks/<string:task_id>',
+        methods=['GET'])
+    def new_get_tasks_instance(dag_id, task_id, execution_date):
+        execution_date = timezone.parse(execution_date)
+        ti = new_get_task_instance(dag_id, task_id, execution_date)
+
+        ti_info = {}
+        if ti:
+            ti_info['state'] = ti.state
+            ti_info['start_date'] = ti.start_date.isoformat() if ti.start_date else None
+            ti_info['end_date'] = ti.end_date.isoformat() if ti.end_date else None
+            ti_info['queued_dttm'] = ti.queued_dttm.isoformat() if ti.queued_dttm else None
+            ti_info['duration'] = ti.duration
+            ti_info['try_number'] = ti.try_number
+            ti_info['max_tries'] = ti.max_tries
+            ti_info['hostname'] = ti.hostname
+            ti_info['unixname'] = ti.unixname
+            ti_info['job_id'] = ti.job_id
+            ti_info['pool'] = ti.pool
+            ti_info['pool_slots'] = ti.pool_slots
+            ti_info['queue'] = ti.queue
+            ti_info['priority_weight'] = ti.priority_weight
+            ti_info['operator'] = ti.operator
+            ti_info['pid'] = ti.pid
+            ti_info['executor_config'] = ti.executor_config
+            return jsonify({'code': 0, 'message': ti_info})
+        else:
+            return jsonify({'code': 1})
+
+    @provide_session
+    def update_job_heartbeat(job_id, session=None):
+        job = session.query(BaseJob).filter(BaseJob.id == job_id).first()
+        job.latest_heartbeat = timezone.utcnow()
+        session.merge(job)
+        session.commit()
+        return job
+
+    @flask_app.route(
+        '/api/experimental/update_heartbeat/<int:job_id>', methods=['GET'])
+    def update_heartbeat(job_id):
+        job = update_job_heartbeat(job_id)
+        return jsonify({'code': 0,
+                        'latest_heartbeat': job.latest_heartbeat.isoformat(),
+                        'state': job.state})
+
+    @provide_session
+    def search_task(external_dag_id,
+                    external_task_id,
+                    serialized_dttm_filter,
+                    check_existence,
+                    allowed_states,
+                    session=None):
+        dttm_filter = [pendulum.parse(date, tz=tz) for date in serialized_dttm_filter]
+        DM = DagModel
+        TI = TaskInstance
+        DR = DagRun
+        if check_existence:
+            dag_to_wait = session.query(DM).filter(
+                DM.dag_id == external_dag_id
+            ).first()
+
+            if not dag_to_wait:
+                raise AirflowException('The external DAG '
+                                       '{} does not exist.'.format(external_dag_id))
+            else:
+                if not os.path.exists(dag_to_wait.fileloc):
+                    raise AirflowException('The external DAG '
+                                           '{} was deleted.'.format(external_dag_id))
+
+            if external_task_id:
+                refreshed_dag_info = DagBag(dag_to_wait.fileloc).get_dag(external_dag_id)
+                if not refreshed_dag_info.has_task(external_task_id):
+                    raise AirflowException('The external task'
+                                           '{} in DAG {} does not exist.'.format(external_task_id,
+                                                                                 external_dag_id))
+        if len(dttm_filter) == 1:
+            if external_task_id:
+                count = session.query(TI).filter(
+                    TI.dag_id == external_dag_id,
+                    TI.task_id == external_task_id,
+                    TI.state.in_(allowed_states),
+                    TI.execution_date.in_(dttm_filter),
+                ).count()
+            else:
+                count = session.query(DR).filter(
+                    DR.dag_id == external_dag_id,
+                    DR.state.in_(allowed_states),
+                    DR.execution_date.in_(dttm_filter),
+                ).count()
+        else:
+            if external_task_id:
+                count = session.query(TI).filter(
+                    TI.dag_id == external_dag_id,
+                    TI.task_id == external_task_id,
+                    TI.state.in_(allowed_states),
+                    TI.execution_date.__ge__(dttm_filter[0]),
+                    TI.execution_date.__le__(dttm_filter[1]),
+                ).count()
+            else:
+                count = session.query(DR).filter(
+                    DR.dag_id == external_dag_id,
+                    DR.state.in_(allowed_states),
+                    DR.execution_date.__ge__(dttm_filter[0]),
+                    DR.execution_date.__le__(dttm_filter[1]),
+                ).count()
+
+        session.commit()
+        if count == 0:
+            raise AirflowException('Not found matched task_instance or dag_dun.')
+        return count
+
+    @flask_app.route(
+        '/api/experimental/task_sensor', methods=['POST'])
+    def task_sensor():
+        data = request.json
+
+        external_dag_id = data.get('external_dag_id', '')
+        if external_dag_id == '':
+            return jsonify({'code': 1, 'msg': 'dag_id can not be null.'})
+
+        serialized_dttm_filter = data.get('serialized_dttm_filter', '')
+        if not isinstance(serialized_dttm_filter, list) or not (0 < len(serialized_dttm_filter) < 3):
+            return jsonify({'code': 1, 'msg': 'serialized_dttm_filter not be correct.'})
+
+        external_task_id = None if data.get('external_task_id', "") == "" else data.get('external_task_id', None)
+        check_existence = True == data.get('check_existence', True)
+
+        allowed_states = data.get('allowed_states', ['success'])
+        if not isinstance(allowed_states, list):
+            return jsonify({'code': 1, 'msg': 'allowed_states must be a list.'})
+
+        try:
+            count = search_task(external_dag_id,
+                                external_task_id,
+                                serialized_dttm_filter,
+                                check_existence,
+                                allowed_states)
+        except Exception as e:
+            return jsonify({'code': 1, 'msg': str(e)})
+
+        return jsonify({'code': 0, 'msg': 'Success criteria met. Found {count} records'.format(count=count)})
+
+    return flask_app
+
+
 @cli_utils.action_logging
 def serve_logs(args):
     print("Starting flask")
+
+    def job_serve():
+        run_args = [
+            'gunicorn',
+            '-w', '4',
+            '-k', 'sync',
+            '-t', '30',
+            '-b', '0.0.0.0:' + conf.get('scheduler', 'job_rest_server_port'),
+            '-n', 'airflow serve_logs',
+            '-c', 'python:airflow.www.gunicorn_config',
+            'airflow.bin.cli:job_serve_app()'
+        ]
+
+        while True:
+            gunicorn_master_proc = subprocess.Popen(run_args, close_fds=True)
+
+            def kill_proc(dummy_signum, dummy_frame):
+                gunicorn_master_proc.terminate()
+                gunicorn_master_proc.wait()
+                sys.exit(0)
+
+            signal.signal(signal.SIGINT, kill_proc)
+            signal.signal(signal.SIGTERM, kill_proc)
+
+            while True:
+                return_code = gunicorn_master_proc.poll()
+                time.sleep(5)
+                if return_code is not None:
+                    print("job_serve exited with return code {return_code}, restart!".format(return_code=return_code))
+                    break
+
+    import multiprocessing
+
+    job_serve_p = multiprocessing.Process(
+        target=job_serve,
+        name="job_serve"
+    )
+
+    job_serve_p.start()
+
+    def kill_proc(dummy_signum, dummy_frame):
+        job_serve_p.terminate()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, kill_proc)
+    signal.signal(signal.SIGTERM, kill_proc)
+
     import flask
     flask_app = flask.Flask(__name__)
 
@@ -1237,7 +1456,7 @@ def serve_logs(args):
             as_attachment=False)
 
     worker_log_server_port = int(conf.get('celery', 'WORKER_LOG_SERVER_PORT'))
-    flask_app.run(host='0.0.0.0', port=worker_log_server_port)
+    flask_app.run(host='0.0.0.0', port=worker_log_server_port, threaded=False, processes=multiprocessing.cpu_count())
 
 
 def _serve_logs(env, skip_serve_logs=False):

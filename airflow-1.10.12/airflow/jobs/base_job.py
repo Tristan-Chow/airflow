@@ -43,6 +43,8 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.net import get_hostname
 from airflow.utils.sqlalchemy import UtcDateTime
 from airflow.utils.state import State
+from airflow.api.client.job_client import job_client
+import os
 
 
 class BaseJob(Base, LoggingMixin):
@@ -313,3 +315,92 @@ class BaseJob(Base, LoggingMixin):
             len(reset_tis), task_instance_str
         )
         return reset_tis
+
+    def new_heartbeat(self, print_error):
+        previous_heartbeat = self.latest_heartbeat
+
+        try:
+            job_client.update_heartbeat(self)
+            previous_heartbeat = self.latest_heartbeat
+
+            if self.state == State.SHUTDOWN:
+                self.kill()
+
+            self.new_heartbeat_callback()
+            self.log.debug('[http:heartbeat]')
+
+            # Figure out how long to sleep for
+            sleep_for = 0
+            if self.latest_heartbeat:
+                seconds_remaining = self.heartrate - \
+                    (timezone.utcnow() - self.latest_heartbeat)\
+                    .total_seconds()
+                sleep_for = max(0, seconds_remaining)
+            while sleep_for > 0:
+                sleep(1)
+                return_code = self.task_runner.return_code()
+                if return_code is not None:
+                    break
+                sleep_for -= 1
+
+        except Exception as e:
+            if not print_error:
+                raise e
+            Stats.incr(
+                convert_camel_to_snake(self.__class__.__name__) + '_http_heartbeat_failure', 1,
+                1)
+            self.log.warn("Use HTTP update heartbeat failed, you can ignore this error. {} ".format(e.args))
+            # We didn't manage to heartbeat, so make sure that the timestamp isn't updated
+            self.latest_heartbeat = previous_heartbeat
+            raise e
+
+    def new_heartbeat_callback(self):
+        """Self destruct task if state has been moved away from running externally"""
+
+        if self.terminating:
+            # ensure termination if processes are created later
+            self.task_runner.terminate()
+            return
+
+        self.task_instance.refresh_from_http()
+        ti = self.task_instance
+
+        fqdn = get_hostname()
+        same_hostname = fqdn == ti.hostname
+        same_process = ti.pid == os.getpid()
+
+        if ti.state == State.RUNNING:
+            if not same_hostname:
+                self.log.warning("The recorded hostname %s "
+                                 "does not match this instance's hostname "
+                                 "%s", ti.hostname, fqdn)
+                raise AirflowException("Hostname of job runner does not match")
+            elif not same_process:
+                current_pid = os.getpid()
+                self.log.warning("Recorded pid %s does not match "
+                                 "the current pid %s", ti.pid, current_pid)
+                raise AirflowException("PID of job runner does not match")
+        elif (
+            self.task_runner.return_code() is None and
+            hasattr(self.task_runner, 'process')
+        ):
+            sleep(2)
+            if (
+                self.task_runner.return_code() is not None or
+                not hasattr(self.task_runner, 'process')
+            ):
+                return
+
+            self.log.warning(
+                "State of this instance has been externally set to %s. "
+                "Taking the poison pill.",
+                ti.state
+            )
+            if ti.state == State.FAILED and ti.task.on_failure_callback:
+                context = ti.get_template_context()
+                ti.task.on_failure_callback(context)
+            if ti.state == State.SUCCESS and ti.task.on_success_callback:
+                context = ti.get_template_context()
+                ti.task.on_success_callback(context)
+            self.task_runner.terminate()
+            self.terminating = True

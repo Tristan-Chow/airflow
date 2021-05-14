@@ -115,6 +115,7 @@ class LocalTaskJob(BaseJob):
             send_execution_warning = notify_execution_sla is not None
             start_time = timezone.utcnow()
 
+            print_error = True
             while True:
                 # Monitor the task to see if it's done
                 return_code = self.task_runner.return_code()
@@ -122,7 +123,11 @@ class LocalTaskJob(BaseJob):
                     self.log.info("Task exited with return code %s", return_code)
                     return
 
-                self.heartbeat()
+                try:
+                    self.new_heartbeat(print_error)
+                except Exception:
+                    print_error = False
+                    self.heartbeat()
 
                 # If it's been too long since we've heartbeat, then it's possible that
                 # the scheduler rescheduled this task, so kill launched processes.
