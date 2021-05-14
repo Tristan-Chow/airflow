@@ -64,6 +64,8 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.sqlalchemy import UtcDateTime, Interval
 from airflow.utils.state import State
 from airflow import event_action
+from airflow.models.schedule_plan import check_following_schedule, check_previous_schedule, latest_time, earliest_time
+
 
 if TYPE_CHECKING:
     from airflow.models.baseoperator import BaseOperator  # Avoid circular dependency
@@ -355,6 +357,20 @@ class DAG(BaseDag, LoggingMixin):
         elif event_action.DR_SLAS in self.notify_events:
             self.notify_events.remove(event_action.DR_SLAS)
 
+        self.schedule_plan = None
+        self.schedule_plan_offset = 0
+        self.base_schedule_interval = None
+        if isinstance(self.schedule_interval, six.string_types) and self.schedule_interval.startswith("@SP:"):
+            # @SP:JYR:1:0 0 * * *
+            sections = [i.strip() for i in self.schedule_interval.split(":")]
+            if len(sections) == 3:
+                self.schedule_plan = sections[1]
+                self.base_schedule_interval = sections[2]
+            elif len(sections) == 4:
+                self.schedule_plan = sections[1]
+                self.schedule_plan_offset = int(sections[2])
+                self.base_schedule_interval = sections[3]
+
     def __repr__(self):
         return "<DAG: {self.dag_id}>".format(self=self)
 
@@ -410,6 +426,52 @@ class DAG(BaseDag, LoggingMixin):
     def date_range(self, start_date, num=None, end_date=timezone.utcnow()):
         if num:
             end_date = None
+        if self.schedule_plan is not None:
+            if end_date and start_date > end_date:
+                raise Exception("Wait. start_date needs to be before end_date")
+            tz = start_date.tzinfo
+            start_date = timezone.make_naive(start_date, tz)
+            dates = []
+            if end_date:
+                if timezone.is_naive(start_date):
+                    end_date = timezone.make_naive(end_date, tz)
+                while start_date <= end_date:
+                    if timezone.is_naive(start_date):
+                        dates.append(timezone.make_aware(start_date, tz))
+                    else:
+                        dates.append(start_date)
+
+                    while True:
+                        cron = croniter(self.normalized_schedule_interval, start_date)
+                        start_date = cron.get_next(datetime)
+                        ok, start_date = check_following_schedule(self.schedule_plan,
+                                                                  start_date, self.schedule_plan_offset, True)
+                        if ok or start_date <= end_date:
+                            break
+                    if start_date == latest_time:
+                        break
+            else:
+                for _ in range(abs(num)):
+                    if timezone.is_naive(start_date):
+                        dates.append(timezone.make_aware(start_date, tz))
+                    else:
+                        dates.append(start_date)
+
+                    while True:
+                        cron = croniter(self.normalized_schedule_interval, start_date)
+                        if num > 0:
+                            start_date = cron.get_next(datetime)
+                            ok, start_date = check_following_schedule(self.schedule_plan,
+                                                                      start_date, self.schedule_plan_offset, True)
+                        else:
+                            start_date = cron.get_prev(datetime)
+                            ok, start_date = check_previous_schedule(self.schedule_plan,
+                                                                      start_date, self.schedule_plan_offset, True)
+                        if ok:
+                            break
+                    if start_date == earliest_time or start_date == latest_time:
+                        break
+            return sorted(dates)
         return utils_date_range(
             start_date=start_date, end_date=end_date,
             num=num, delta=self.normalized_schedule_interval)
@@ -431,7 +493,7 @@ class DAG(BaseDag, LoggingMixin):
 
         return False
 
-    def following_schedule(self, dttm):
+    def following_schedule_old(self, dttm):
         """
         Calculates the following schedule for this dag in UTC.
 
@@ -459,7 +521,17 @@ class DAG(BaseDag, LoggingMixin):
         elif self.normalized_schedule_interval is not None:
             return dttm + self.normalized_schedule_interval
 
-    def previous_schedule(self, dttm):
+    def following_schedule(self, dttm):
+        while True:
+            dttm = self.following_schedule_old(dttm)
+            if self.schedule_plan is None:
+                break
+            ok, dttm = check_following_schedule(self.schedule_plan, dttm, self.schedule_plan_offset)
+            if ok:
+                break
+        return dttm
+
+    def previous_schedule_old(self, dttm):
         """
         Calculates the previous schedule for this dag in UTC
 
@@ -486,6 +558,16 @@ class DAG(BaseDag, LoggingMixin):
             return timezone.convert_to_utc(previous)
         elif self.normalized_schedule_interval is not None:
             return dttm - self.normalized_schedule_interval
+
+    def previous_schedule(self, dttm):
+        while True:
+            dttm = self.previous_schedule_old(dttm)
+            if self.schedule_plan is None:
+                break
+            ok, dttm = check_previous_schedule(self.schedule_plan, dttm, self.schedule_plan_offset)
+            if ok:
+                break
+        return dttm
 
     def get_run_dates(self, start_date, end_date=None):
         """
@@ -679,7 +761,9 @@ class DAG(BaseDag, LoggingMixin):
         2. If Schedule Interval is "@once" return "None"
         3. If not (1) or (2) returns schedule_interval
         """
-        if isinstance(self.schedule_interval, six.string_types) and self.schedule_interval in cron_presets:
+        if self.base_schedule_interval is not None:
+            _schedule_interval = self.base_schedule_interval
+        elif isinstance(self.schedule_interval, six.string_types) and self.schedule_interval in cron_presets:
             _schedule_interval = cron_presets.get(self.schedule_interval)  # type: Optional[ScheduleInterval]
         elif self.schedule_interval == '@once':
             _schedule_interval = None

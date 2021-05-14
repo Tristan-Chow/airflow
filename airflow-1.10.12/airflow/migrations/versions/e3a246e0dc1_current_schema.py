@@ -268,6 +268,21 @@ def upgrade():
             sa.Column('timestamp', sa.DateTime(), nullable=True),
             sa.PrimaryKeyConstraint('dag_id', 'execution_date')
         )
+    if 'schedule_plan_tag' not in tables:
+        op.create_table(
+            'schedule_plan_tag',
+            sa.Column('name', sa.String(length=250), nullable=False),
+            sa.Column('description', sa.Text(), nullable=True),
+            sa.PrimaryKeyConstraint('name')
+        )
+
+    if 'schedule_plan' not in tables:
+        op.create_table(
+            'schedule_plan',
+            sa.Column('tag', sa.String(length=250), nullable=False),
+            sa.Column('schedule_date', sa.Date(), nullable=False),
+            sa.PrimaryKeyConstraint('tag', 'schedule_date')
+        )
 
 
 def downgrade():
@@ -291,3 +306,5 @@ def downgrade():
     op.drop_table('connection')
     op.drop_table('xcom')
     op.drop_table('dag_sla_miss')
+    op.drop_table('schedule_plan')
+    op.drop_table('schedule_plan_tag')

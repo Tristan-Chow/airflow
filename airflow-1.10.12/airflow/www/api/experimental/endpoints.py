@@ -36,6 +36,8 @@ from airflow.utils import timezone
 from airflow.utils.strings import to_boolean
 from airflow.www.app import csrf
 from airflow import models
+from airflow.utils.db import provide_session
+from airflow.models.schedule_plan_tag import SchedulePlanTag as SPT
 
 log = logging.getLogger(__name__)
 
@@ -365,3 +367,22 @@ def delete_pool(name):
         return response
     else:
         return jsonify(pool.to_json())
+
+
+@csrf.exempt
+@api_experimental.route('/schedule_plan_tags')
+@requires_authentication
+@provide_session
+def get_schedule_plan_tags(session=None):
+    """Delete pool."""
+    try:
+        spts = session.query(SPT).all()
+    except AirflowException as err:
+        log.error(err)
+        response = jsonify(error="{}".format(err))
+        response.status_code = err.status_code
+        return response
+    else:
+        return jsonify([{'name': s.name, 'description': s.description} for s in spts])
+
+
