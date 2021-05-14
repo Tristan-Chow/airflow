@@ -95,7 +95,6 @@ CHART_LIMIT = 200000
 
 UTF8_READER = codecs.getreader('utf-8')
 
-dagbag = models.DagBag(settings.DAGS_FOLDER, store_serialized_dags=STORE_SERIALIZED_DAGS)
 
 login_required = airflow.login.login_required
 current_user = airflow.login.current_user
@@ -110,6 +109,48 @@ log = logging.getLogger(__name__)
 if conf.getboolean('webserver', 'FILTER_BY_OWNER'):
     # filter_by_owner if authentication is enabled and filter_by_owner is true
     FILTER_BY_OWNER = not current_app.config['LOGIN_DISABLED']
+
+
+cache_dag_bag = None
+
+
+def clear_cache_dag_bag():
+    global cache_dag_bag
+    cache_dag_bag = None
+
+
+def get_dag_bag(dag_id=None, use_cache=False):
+    if not use_cache or not dag_id:
+        if not dag_id:
+            return models.DagBag(dag_folder=settings.DAGS_FOLDER)
+        else:
+            dag = models.DagModel.get_current(dag_id)
+            if not dag:
+                return models.DagBag(dag_folder="/nonexistence_dag_folder")
+            else:
+                return models.DagBag(dag_folder=dag.fileloc, safe_mode=False)
+    else:
+        global cache_dag_bag
+        if cache_dag_bag:
+            if dag_id not in cache_dag_bag.dag_ids:
+                dag = models.DagModel.get_current(dag_id)
+                if not dag:
+                    return cache_dag_bag
+                else:
+                    temp_dag_bag = models.DagBag(dag_folder=dag.fileloc, safe_mode=False)
+                    for dag_id in temp_dag_bag.dag_ids:
+                        cache_dag_bag.dags[dag_id] = temp_dag_bag.get_dag(dag_id)
+                    return cache_dag_bag
+        else:
+            if not dag_id:
+                cache_dag_bag = models.DagBag(dag_folder=settings.DAGS_FOLDER)
+            else:
+                dag = models.DagModel.get_current(dag_id)
+                if not dag:
+                    cache_dag_bag = models.DagBag(dag_folder="/nonexistence_dag_folder")
+                else:
+                    cache_dag_bag = models.DagBag(dag_folder=dag.fileloc, safe_mode=False)
+        return cache_dag_bag
 
 
 def dag_link(v, c, m, p):
@@ -738,6 +779,7 @@ class Airflow(AirflowViewMixin, BaseView):
     @provide_session
     def dag_details(self, session=None):
         dag_id = request.args.get('dag_id')
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         title = "DAG details"
         root = request.args.get('root', '')
@@ -793,6 +835,7 @@ class Airflow(AirflowViewMixin, BaseView):
     def pickle_info(self):
         d = {}
         dag_id = request.args.get('dag_id')
+        dagbag = get_dag_bag(dag_id)
         dags = [dagbag.dags.get(dag_id)] if dag_id else dagbag.dags.values()
         for dag in dags:
             if not dag.is_subdag:
@@ -822,6 +865,7 @@ class Airflow(AirflowViewMixin, BaseView):
         root = request.args.get('root', '')
 
         logging.info("Retrieving rendered templates.")
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
 
         task = copy.copy(dag.get_task(task_id))
@@ -909,6 +953,7 @@ class Airflow(AirflowViewMixin, BaseView):
 
         try:
             if ti is not None:
+                dagbag = get_dag_bag(dag_id)
                 dag = dagbag.get_dag(dag_id)
                 ti.task = dag.get_task(ti.task_id)
             if response_format == 'json':
@@ -956,6 +1001,7 @@ class Airflow(AirflowViewMixin, BaseView):
         execution_date = request.args.get('execution_date')
         dttm = pendulum.parse(execution_date)
         form = DateTimeForm(data={'execution_date': dttm})
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
 
         ti = session.query(models.TaskInstance).filter(
@@ -1009,6 +1055,7 @@ class Airflow(AirflowViewMixin, BaseView):
         dttm = pendulum.parse(execution_date)
         form = DateTimeForm(data={'execution_date': dttm})
         root = request.args.get('root', '')
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
 
         if not dag or task_id not in dag.task_ids:
@@ -1137,6 +1184,7 @@ class Airflow(AirflowViewMixin, BaseView):
         task_id = request.form.get('task_id')
         origin = get_safe_url(request.form.get('origin'))
 
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         task = dag.get_task(task_id)
 
@@ -1267,6 +1315,7 @@ class Airflow(AirflowViewMixin, BaseView):
                     conf=conf,
                 )
 
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         dag.create_dagrun(
             run_id=run_id,
@@ -1332,6 +1381,7 @@ class Airflow(AirflowViewMixin, BaseView):
         dag_id = request.form.get('dag_id')
         task_id = request.form.get('task_id')
         origin = get_safe_url(request.form.get('origin'))
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
 
         execution_date = request.form.get('execution_date')
@@ -1365,6 +1415,7 @@ class Airflow(AirflowViewMixin, BaseView):
         execution_date = request.form.get('execution_date')
         confirmed = request.form.get('confirmed') == "true"
 
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         execution_date = pendulum.parse(execution_date)
         start_date = execution_date
@@ -1385,8 +1436,10 @@ class Airflow(AirflowViewMixin, BaseView):
             .all()
 
         payload = []
+        clear_cache_dag_bag()
         for dag_id, active_dag_runs in dags:
             max_active_runs = 0
+            dagbag = get_dag_bag(dag_id, True)
             dag = dagbag.get_dag(dag_id)
 
             if dag:
@@ -1405,6 +1458,7 @@ class Airflow(AirflowViewMixin, BaseView):
             return redirect(origin)
 
         execution_date = pendulum.parse(execution_date)
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
 
         if not dag:
@@ -1433,6 +1487,7 @@ class Airflow(AirflowViewMixin, BaseView):
             return redirect(origin)
 
         execution_date = pendulum.parse(execution_date)
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
 
         if not dag:
@@ -1483,6 +1538,7 @@ class Airflow(AirflowViewMixin, BaseView):
     def _mark_task_instance_state(self, dag_id, task_id, origin, execution_date,
                                   confirmed, upstream, downstream,
                                   future, past, state):
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         task = dag.get_task(task_id)
         task.dag = dag
@@ -1571,6 +1627,7 @@ class Airflow(AirflowViewMixin, BaseView):
         default_dag_run = conf.getint('webserver', 'default_dag_run_display_number')
         dag_id = request.args.get('dag_id')
         blur = conf.getboolean('webserver', 'demo_mode')
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         if not dag:
             flash('DAG "{0}" seems to be missing.'.format(dag_id), "error")
@@ -1698,6 +1755,7 @@ class Airflow(AirflowViewMixin, BaseView):
     def graph(self, session=None):
         dag_id = request.args.get('dag_id')
         blur = conf.getboolean('webserver', 'demo_mode')
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         if not dag:
             flash('DAG "{0}" seems to be missing.'.format(dag_id), "error")
@@ -1794,6 +1852,7 @@ class Airflow(AirflowViewMixin, BaseView):
     def duration(self, session=None):
         default_dag_run = conf.getint('webserver', 'default_dag_run_display_number')
         dag_id = request.args.get('dag_id')
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         base_date = request.args.get('base_date')
         num_runs = request.args.get('num_runs')
@@ -1907,6 +1966,7 @@ class Airflow(AirflowViewMixin, BaseView):
     def tries(self, session=None):
         default_dag_run = conf.getint('webserver', 'default_dag_run_display_number')
         dag_id = request.args.get('dag_id')
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         base_date = request.args.get('base_date')
         num_runs = request.args.get('num_runs')
@@ -1973,6 +2033,7 @@ class Airflow(AirflowViewMixin, BaseView):
     def landing_times(self, session=None):
         default_dag_run = conf.getint('webserver', 'default_dag_run_display_number')
         dag_id = request.args.get('dag_id')
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         base_date = request.args.get('base_date')
         num_runs = request.args.get('num_runs')
@@ -2082,6 +2143,7 @@ class Airflow(AirflowViewMixin, BaseView):
     @provide_session
     def gantt(self, session=None):
         dag_id = request.args.get('dag_id')
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
         demo_mode = conf.getboolean('webserver', 'demo_mode')
 
@@ -2181,6 +2243,7 @@ class Airflow(AirflowViewMixin, BaseView):
     @provide_session
     def task_instances(self, session=None):
         dag_id = request.args.get('dag_id')
+        dagbag = get_dag_bag(dag_id)
         dag = dagbag.get_dag(dag_id)
 
         dttm = request.args.get('execution_date')
@@ -2928,7 +2991,9 @@ class DagRunModelView(ModelViewOnly):
             count = 0
             dirty_ids = []
             altered_tis = []
+            clear_cache_dag_bag()
             for dr in session.query(DR).filter(DR.id.in_(ids)).all():
+                dagbag = get_dag_bag(dr.dag_id, True)
                 dirty_ids.append(dr.dag_id)
                 count += 1
                 altered_tis += \
@@ -2954,7 +3019,9 @@ class DagRunModelView(ModelViewOnly):
             count = 0
             dirty_ids = []
             altered_tis = []
+            clear_cache_dag_bag()
             for dr in session.query(DR).filter(DR.id.in_(ids)).all():
+                dagbag = get_dag_bag(dr.dag_id, True)
                 dirty_ids.append(dr.dag_id)
                 count += 1
                 altered_tis += \
@@ -2974,6 +3041,7 @@ class DagRunModelView(ModelViewOnly):
     # Called after editing DagRun model in the UI.
     @provide_session
     def after_model_change(self, form, dagrun, is_created, session=None):
+        dagbag = get_dag_bag(dagrun.dag_id)
         altered_tis = []
         if dagrun.state == State.SUCCESS:
             altered_tis = set_dag_run_state_to_success(
@@ -3076,9 +3144,12 @@ class TaskInstanceModelView(ModelViewOnly):
             dag_to_task_details = {}
             dag_to_tis = {}
 
+            clear_cache_dag_bag()
+
             # Collect dags upfront as dagbag.get_dag() will reset the session
             for id_str in ids:
                 task_id, dag_id, execution_date = iterdecode(id_str)
+                dagbag = get_dag_bag(dag_id, True)
                 dag = dagbag.get_dag(dag_id)
                 task_details = dag_to_task_details.setdefault(dag, [])
                 task_details.append((task_id, execution_date))
