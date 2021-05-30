@@ -639,11 +639,16 @@ def mkdir_p(path):
 
 
 def get_airflow_home():
-    return expand_env_var(os.environ.get('AIRFLOW_HOME', '~/airflow'))
+    if os.path.exists('/etc/airflow/airflowConf'):
+        return expand_env_var(os.environ.get('AIRFLOW_HOME', '/etc/airflow/airflowConf'))
+    else:
+        return expand_env_var(os.environ.get('AIRFLOW_HOME', '~/airflow'))
 
 
 def get_airflow_config(airflow_home):
     if 'AIRFLOW_CONFIG' not in os.environ:
+        if os.path.exists('/etc/airflow/airflowConf/airflow.cfg'):
+            return '/etc/airflow/airflowConf/airflow.cfg'
         return os.path.join(airflow_home, 'airflow.cfg')
     return expand_env_var(os.environ['AIRFLOW_CONFIG'])
 
@@ -695,7 +700,7 @@ def get_airflow_test_config(airflow_home):
     return expand_env_var(os.environ['AIRFLOW_TEST_CONFIG'])
 
 
-TEST_CONFIG_FILE = get_airflow_test_config(AIRFLOW_HOME)
+TEST_CONFIG_FILE = '/tmp/unittests.cfg'
 
 # only generate a Fernet key if we need to create a new config file
 if not os.path.isfile(TEST_CONFIG_FILE) or not os.path.isfile(AIRFLOW_CONFIG):
