@@ -82,6 +82,7 @@ from airflow.www_rbac.app import cached_app as cached_app_rbac
 from airflow.www_rbac.app import create_app as create_app_rbac
 from airflow.www_rbac.app import cached_appbuilder
 from airflow.version import version as airflow_version
+from airflow.utils.timezone import utcnow
 
 import pygments
 from pygments.formatters.terminal import TerminalFormatter
@@ -111,6 +112,10 @@ def sigquit_handler(sig, frame):
     """Helps debug deadlocks by printing stacktraces when this gets a SIGQUIT
     e.g. kill -s QUIT <PID> or CTRL+\
     """
+    current = sys.stdout
+    dump_path = "/tmp/airflow-" + utcnow().isoformat() + "-" + str(os.getpid()) + ".dump"
+    f = open(dump_path, "w")
+    sys.stdout = f
     print("Dumping stack traces for all threads in PID {}".format(os.getpid()))
     id_to_name = dict([(th.ident, th.name) for th in threading.enumerate()])
     code = []
@@ -123,6 +128,8 @@ def sigquit_handler(sig, frame):
             if line:
                 code.append("  {}".format(line.strip()))
     print("\n".join(code))
+    sys.stdout = current
+    f.close()
 
 
 def setup_logging(filename):
@@ -1980,6 +1987,84 @@ def config(args):
         print(code)
 
 
+@cli_utils.action_logging
+def master(args):
+    print(settings.HEADER)
+    from airflow.cluster import BaseDagFileManager, get_dag_file_manager
+    dag_file_manager = get_dag_file_manager()
+    if args.daemon:
+        pid, stdout, stderr, log_file = setup_locations("master",
+                                                        args.pid,
+                                                        args.stdout,
+                                                        args.stderr,
+                                                        args.log_file)
+        handle = setup_logging(log_file)
+        stdout = open(stdout, 'w+')
+        stderr = open(stderr, 'w+')
+        ctx = daemon.DaemonContext(
+            pidfile=TimeoutPIDLockFile(pid, -1),
+            files_preserve=[handle],
+            stdout=stdout,
+            stderr=stderr,
+        )
+        with ctx:
+            dag_file_manager.start_server()
+    else:
+        signal.signal(signal.SIGINT, sigint_handler)
+        signal.signal(signal.SIGTERM, sigint_handler)
+        signal.signal(signal.SIGQUIT, sigquit_handler)
+
+        while True:
+            try:
+                dag_file_manager.start_server()
+                sys.exit(0)
+            except Exception as e:
+                traceback.print_exc()
+                BaseDagFileManager.TRY_NUMBER += 1
+                if BaseDagFileManager.TRY_NUMBER > 2:
+                    break
+                time.sleep(30)
+                dag_file_manager = get_dag_file_manager()
+        sys.exit(1)
+
+
+def exit_func(status, message):
+    print(message)
+    sys.exit(status)
+
+
+@cli_utils.action_logging
+def cluster(args):
+    print(settings.HEADER)
+    if not settings.SCHEDULER_CLUSTER:
+        exit_func(1, 'Scheduler is in Standalone mode, `cluster` command not support.')
+
+    def get_real_path(file_path):
+        if file_path is None:
+            exit_func(1, 'You must give a Dag file Path.')
+        else:
+            file_path = os.path.abspath(file_path)
+            if not os.path.isfile(file_path):
+                exit_func(1, "Must be a file.")
+            if not file_path.startswith(settings.DAGS_FOLDER):
+                exit_func(1, "This file should in dags folder.")
+            return file_path
+
+    from airflow.cluster import get_dag_file_manager
+    dag_file_manager = get_dag_file_manager()
+    if args.add:
+        path = get_real_path(args.path)
+        dag_file_manager.upsert_path(path)
+        print("Add %s Successfully.".format(path))
+
+    if args.path is not None:
+        path = get_real_path(args.path)
+        dag_file_manager.print_path_info(path)
+        return
+
+    dag_file_manager.print_cluster_info()
+
+
 class Anonymizer(Protocol):
     """Anonymizer protocol."""
 
@@ -2880,7 +2965,16 @@ class CLIFactory(object):
                 'Send output to file.io service and returns link.'
             ),
             action='store_true'
-        )
+        ),
+        'path': Arg(
+            ("-p", "--path"),
+            "May be a dag file path."
+        ),
+        'add_path': Arg(
+            ('-a', '--add'),
+            help='Add a path',
+            action='store_true'
+        ),
     }
     subparsers = (
         {
@@ -3091,6 +3185,16 @@ class CLIFactory(object):
             'help': 'Show information about current Airflow and environment',
             'func': info,
             'args': ('anonymize', 'file_io', ),
+        },
+        {
+            'func': master,
+            'help': "Start a master instance",
+            'args': ('do_pickle', 'pid', 'daemon', 'stdout', 'stderr', 'log_file'),
+        },
+        {
+            'func': cluster,
+            'help': "List scheduler cluster information",
+            'args': ('path', 'add_path'),
         },
     )
     subparsers_dict = {sp['func'].__name__: sp for sp in subparsers}

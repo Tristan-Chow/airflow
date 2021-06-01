@@ -237,7 +237,7 @@ class BaseJob(Base, LoggingMixin):
         raise NotImplementedError("This method needs to be overridden")
 
     @provide_session
-    def reset_state_for_orphaned_tasks(self, filter_by_dag_run=None, session=None):
+    def reset_state_for_orphaned_tasks(self, filter_by_dag_run=None, session=None, dag_ids=None):
         """
         This function checks if there are any tasks in the dagrun (or all)
         that have a scheduled state but are not known by the
@@ -261,15 +261,18 @@ class BaseJob(Base, LoggingMixin):
         TI = models.TaskInstance
         DR = models.DagRun
         if filter_by_dag_run is None:
+            query = (session
+                     .query(TI)
+                     .join(
+                         DR,
+                         and_(
+                             TI.dag_id == DR.dag_id,
+                             TI.execution_date == DR.execution_date)))
+            if dag_ids is not None:
+                query = query.filter(TI.dag_id.in_(dag_ids))
+
             resettable_tis = (
-                session
-                .query(TI)
-                .join(
-                    DR,
-                    and_(
-                        TI.dag_id == DR.dag_id,
-                        TI.execution_date == DR.execution_date))
-                .filter(
+                query.filter(
                     DR.state == State.RUNNING,
                     DR.run_id.notlike(BackfillJob.ID_PREFIX + '%'),
                     TI.state.in_(resettable_states))).all()

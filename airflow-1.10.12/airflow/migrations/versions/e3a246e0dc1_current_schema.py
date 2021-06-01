@@ -284,6 +284,35 @@ def upgrade():
             sa.PrimaryKeyConstraint('tag', 'schedule_date')
         )
 
+    if 'dag_file' not in tables:
+        op.create_table(
+            'dag_file',
+            sa.Column('fileloc', sa.String(length=700), nullable=False),
+            sa.Column('node_id', sa.Integer(), nullable=True),
+            sa.Column('state', sa.String(length=20), nullable=True),
+            sa.Column('is_exist', sa.Boolean(), nullable=True),
+            sa.Column('latest_refresh', sa.DateTime(), nullable=True),
+            sa.PrimaryKeyConstraint('fileloc')
+        )
+        op.create_index('df_node_id', 'dag_file', ['node_id'], unique=False)
+        op.create_index('df_state', 'dag_file', ['state'], unique=False)
+        op.create_index('df_is_exist', 'dag_file', ['is_exist'], unique=False)
+        op.create_index('df_latest_refresh', 'dag_file', ['latest_refresh'], unique=False)
+
+    if 'node_instance' not in tables:
+        op.create_table(
+            'node_instance',
+            sa.Column('id', sa.Integer(), nullable=False),
+            sa.Column('instance', sa.String(length=100), nullable=False),
+            sa.Column('hostname', sa.String(length=500), nullable=True),
+            sa.Column('state', sa.String(length=20), nullable=True),
+            sa.Column('start_date', sa.DateTime(), nullable=True),
+            sa.Column('latest_heartbeat', sa.DateTime(), nullable=True),
+            sa.PrimaryKeyConstraint('id')
+        )
+        op.create_index('ni_instance', 'node_instance', ['instance'], unique=False)
+        op.create_index('ni_state', 'node_instance', ['state'], unique=False)
+
 
 def downgrade():
     op.drop_table('known_event')
@@ -308,3 +337,5 @@ def downgrade():
     op.drop_table('dag_sla_miss')
     op.drop_table('schedule_plan')
     op.drop_table('schedule_plan_tag')
+    op.drop_table('dag_file')
+    op.drop_table('node_instance')

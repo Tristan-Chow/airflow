@@ -1421,10 +1421,12 @@ class SchedulerJob(BaseJob):
         self.log.info("Running execute loop for %s seconds", self.run_duration)
         self.log.info("Processing each file at most %s times", self.num_runs)
 
-        # Build up a list of Python files that could contain DAGs
-        self.log.info("Searching for files in %s", self.subdir)
-        known_file_paths = list_py_file_paths(self.subdir)
-        self.log.info("There are %s files in %s", len(known_file_paths), self.subdir)
+        known_file_paths = []
+        if not settings.SCHEDULER_CLUSTER:
+            # Build up a list of Python files that could contain DAGs
+            self.log.info("Searching for files in %s", self.subdir)
+            known_file_paths = list_py_file_paths(self.subdir)
+            self.log.info("There are %s files in %s", len(known_file_paths), self.subdir)
 
         # When using sqlite, we do not use async_mode
         # so the scheduler job and DAG parser don't access the DB at the same time.
@@ -1481,8 +1483,9 @@ class SchedulerJob(BaseJob):
         """
         self.executor.start()
 
-        self.log.info("Resetting orphaned tasks for active dag runs")
-        self.reset_state_for_orphaned_tasks()
+        if not settings.SCHEDULER_CLUSTER:
+            self.log.info("Resetting orphaned tasks for active dag runs")
+            self.reset_state_for_orphaned_tasks()
 
         # Start after resetting orphaned tasks to avoid stressing out DB.
         self.processor_agent.start()

@@ -316,6 +316,16 @@ def create_default_connections(session=None):
             host='', password=''), session)
 
 
+@provide_session
+def create_master_instance(session=None):
+    from airflow.cluster.nodeinstance import NodeInstance, NODE_INSTANCE_DEAD, INSTANCE_MASTER
+    from airflow.cluster.db_dag_file_manager import DbDagFileManager
+    NI = NodeInstance
+    if not session.query(NI).filter(NI.id == DbDagFileManager.MASTER_ID).first():
+        session.add(NI(id=DbDagFileManager.MASTER_ID, instance=INSTANCE_MASTER, state=NODE_INSTANCE_DEAD))
+        session.commit()
+
+
 def initdb(rbac=False):
     session = settings.Session()
 
@@ -324,7 +334,7 @@ def initdb(rbac=False):
 
     if conf.getboolean('core', 'LOAD_DEFAULT_CONNECTIONS', fallback=True):
         create_default_connections()
-
+    create_master_instance()
     # Known event types
     KET = models.KnownEventType
     if not session.query(KET).filter(KET.know_event_type == 'Holiday').first():

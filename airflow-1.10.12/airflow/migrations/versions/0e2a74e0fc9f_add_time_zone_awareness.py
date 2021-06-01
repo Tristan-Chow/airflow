@@ -172,6 +172,25 @@ def upgrade():
             column_name="timestamp",
             type_=mysql.TIMESTAMP(fsp=6),
         )
+        op.alter_column(
+            table_name="dag_file",
+            column_name="latest_refresh",
+            type_=mysql.TIMESTAMP(fsp=6),
+            nullable=True,
+        )
+        op.alter_column(
+            table_name="node_instance",
+            column_name="start_date",
+            type_=mysql.TIMESTAMP(fsp=6),
+            nullable=True,
+        )
+        op.alter_column(
+            table_name="node_instance",
+            column_name="latest_heartbeat",
+            type_=mysql.TIMESTAMP(fsp=6),
+            nullable=True,
+        )
+
     else:
         # sqlite and mssql datetime are fine as is.  Therefore, not converting
         if conn.dialect.name in ("sqlite", "mssql"):
@@ -328,6 +347,25 @@ def upgrade():
             type_=sa.TIMESTAMP(timezone=True),
         )
 
+        op.alter_column(
+            table_name="dag_file",
+            column_name="latest_refresh",
+            type_=sa.TIMESTAMP(timezone=True),
+            nullable=True,
+        )
+        op.alter_column(
+            table_name="node_instance",
+            column_name="start_date",
+            type_=sa.TIMESTAMP(timezone=True),
+            nullable=True,
+        )
+        op.alter_column(
+            table_name="node_instance",
+            column_name="latest_heartbeat",
+            type_=sa.TIMESTAMP(timezone=True),
+            nullable=True,
+        )
+
 
 def downgrade():
     conn = op.get_bind()
@@ -452,6 +490,16 @@ def downgrade():
             table_name="dag_sla_miss", column_name="timestamp", type_=mysql.DATETIME(fsp=6)
         )
 
+        op.alter_column(
+            table_name="dag_file", column_name="latest_refresh", type_=mysql.DATETIME(fsp=6), nullable=True,
+        )
+        op.alter_column(
+            table_name="node_instance", column_name="start_date", type_=mysql.DATETIME(fsp=6), nullable=True,
+        )
+        op.alter_column(
+            table_name="node_instance", column_name="latest_heartbeat", type_=mysql.DATETIME(fsp=6), nullable=True,
+        )
+
     else:
         if conn.dialect.name in ("sqlite", "mssql"):
             return
@@ -550,4 +598,14 @@ def downgrade():
         )
         op.alter_column(
             table_name="dag_sla_miss", column_name="timestamp", type_=sa.DateTime()
+        )
+
+        op.alter_column(
+            table_name="dag_file", column_name="latest_refresh", type_=sa.DateTime(), nullable=True,
+        )
+        op.alter_column(
+            table_name="node_instance", column_name="start_date", type_=sa.DateTime(),nullable=True,
+        )
+        op.alter_column(
+            table_name="node_instance", column_name="latest_heartbeat", type_=sa.DateTime(), nullable=True,
         )

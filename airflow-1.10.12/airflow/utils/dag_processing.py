@@ -50,13 +50,13 @@ from airflow.dag.base_dag import BaseDag, BaseDagBag
 from airflow.exceptions import AirflowException
 from airflow.settings import Stats
 from airflow.models import errors
-from airflow.settings import STORE_DAG_CODE, STORE_SERIALIZED_DAGS
 from airflow.utils import timezone
 from airflow.utils.helpers import reap_process_group
 from airflow.utils.db import provide_session
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.mixins import MultiprocessingStartMethodMixin
 from airflow.utils.state import State
+from airflow.cluster import get_dag_file_manager
 
 if six.PY2:
     ConnectionError = IOError
@@ -293,8 +293,32 @@ def correct_maybe_zipped(fileloc):
 COMMENT_PATTERN = re.compile(r"\s*#.*")
 
 
+def check_file(file_path, patterns, safe_mode):
+    if not os.path.isfile(file_path):
+        return False
+    mod_name, file_ext = os.path.splitext(
+        os.path.split(file_path)[-1])
+    if file_ext != '.py' and not zipfile.is_zipfile(file_path):
+        return False
+    if any([re.findall(p, file_path) for p in patterns]):
+        return False
+
+    # Heuristic that guesses whether a Python file contains an
+    # Airflow DAG definition.
+    might_contain_dag = True
+    if safe_mode and not zipfile.is_zipfile(file_path):
+        with open(file_path, 'rb') as fp:
+            content = fp.read()
+            might_contain_dag = all(
+                [s in content for s in (b'DAG', b'airflow')])
+
+    if not might_contain_dag:
+        return False
+    return True
+
+
 def list_py_file_paths(directory, safe_mode=conf.getboolean('core', 'DAG_DISCOVERY_SAFE_MODE', fallback=True),
-                       include_examples=None):
+                       include_examples=None, depth=0):
     """
     Traverse a directory and look for Python files.
 
@@ -307,6 +331,8 @@ def list_py_file_paths(directory, safe_mode=conf.getboolean('core', 'DAG_DISCOVE
     :type safe_mode: bool
     :param include_examples: include example DAGs
     :type include_examples: bool
+    :param depth: The depth of dir to search for dag file
+    :type depth: int
     :return: a list of paths to Python files in the specified directory
     :rtype: list[unicode]
     """
@@ -320,6 +346,8 @@ def list_py_file_paths(directory, safe_mode=conf.getboolean('core', 'DAG_DISCOVE
     elif os.path.isdir(directory):
         patterns_by_dir = {}
         for root, dirs, files in os.walk(directory, followlinks=True):
+            if depth != 0 and depth <= len([p for p in os.path.relpath(root, directory).split(os.path.sep) if p != "."]):
+                continue
             patterns = patterns_by_dir.get(root, [])
             ignore_file = os.path.join(root, '.airflowignore')
             if os.path.isfile(ignore_file):
@@ -346,27 +374,8 @@ def list_py_file_paths(directory, safe_mode=conf.getboolean('core', 'DAG_DISCOVE
             for f in files:
                 try:
                     file_path = os.path.join(root, f)
-                    if not os.path.isfile(file_path):
+                    if not check_file(file_path, patterns, safe_mode):
                         continue
-                    mod_name, file_ext = os.path.splitext(
-                        os.path.split(file_path)[-1])
-                    if file_ext != '.py' and not zipfile.is_zipfile(file_path):
-                        continue
-                    if any([re.findall(p, file_path) for p in patterns]):
-                        continue
-
-                    # Heuristic that guesses whether a Python file contains an
-                    # Airflow DAG definition.
-                    might_contain_dag = True
-                    if safe_mode and not zipfile.is_zipfile(file_path):
-                        with open(file_path, 'rb') as fp:
-                            content = fp.read()
-                            might_contain_dag = all(
-                                [s in content for s in (b'DAG', b'airflow')])
-
-                    if not might_contain_dag:
-                        continue
-
                     file_paths.append(file_path)
                 except Exception:
                     log.exception("Error while examining %s", f)
@@ -630,8 +639,15 @@ class DagFileProcessorAgent(LoggingMixin, MultiprocessingStartMethodMixin):
                                                     dag_ids,
                                                     pickle_dags,
                                                     async_mode)
-
-        processor_manager.start()
+        try:
+            processor_manager.start()
+        finally:
+            if processor_manager.dag_file_manager is not None:
+                try:
+                    processor_manager.dag_file_manager.logout()
+                    processor_manager.log.info("Logout success.")
+                except Exception as e:
+                    processor_manager.log.exception("Logout failed.", e)
 
     def harvest_simple_dags(self):
         """
@@ -796,8 +812,6 @@ class DagFileProcessorManager(LoggingMixin):
         self._file_stats = {}  # type: dict(str, DagFileStat)
 
         self._last_zombie_query_time = None
-        # Last time that the DAG dir was traversed to look for files
-        self.last_dag_dir_refresh_time = timezone.utcnow()
         # Last time stats were printed
         self.last_stat_print_time = timezone.datetime(2000, 1, 1)
         # TODO: Remove magic number
@@ -806,10 +820,8 @@ class DagFileProcessorManager(LoggingMixin):
         self._zombies = self.mmg.dict()
         # How long to wait before timing out a process to parse a DAG file
         self._processor_timeout = processor_timeout
-
-        # How often to scan the DAGs directory for new files. Default to 5 minutes.
-        self.dag_dir_list_interval = conf.getint('scheduler',
-                                                 'dag_dir_list_interval')
+        self.dag_file_manager = None
+        self.base_job = None
 
         self._log = logging.getLogger('airflow.processor_manager')
 
@@ -839,9 +851,6 @@ class DagFileProcessorManager(LoggingMixin):
 
         self.log.info("Processing files using up to %s processes at a time ", self._parallelism)
         self.log.info("Process each file at most once every %s seconds", self._file_process_interval)
-        self.log.info(
-            "Checking for new files in %s every %s seconds", self._dag_directory, self.dag_dir_list_interval
-        )
 
         # In sync mode we want timeout=None -- wait forever until a message is received
         if self._async_mode:
@@ -851,8 +860,10 @@ class DagFileProcessorManager(LoggingMixin):
 
         # Used to track how long it takes us to get once around every file in the DAG folder.
         self._parsing_start_time = timezone.utcnow()
+
+        self.dag_file_manager = get_dag_file_manager(self.log)
+        self.dag_file_manager.registry_scheduler()
         while True:
-            loop_start_time = time.time()
 
             if self._signal_conn.poll(poll_time):
                 agent_signal = self._signal_conn.recv()
@@ -871,8 +882,9 @@ class DagFileProcessorManager(LoggingMixin):
                 # are told to (as that would open another connection to the
                 # SQLite DB which isn't a good practice
                 continue
+            loop_start_time = time.time()
             # pylint: enable=no-else-break
-            self._refresh_dag_dir()
+            self._refresh_dag()
             self._find_zombies()  # pylint: disable=no-value-for-parameter
 
             self._kill_timed_out_processors()
@@ -929,35 +941,38 @@ class DagFileProcessorManager(LoggingMixin):
                 else:
                     poll_time = 0.0
 
-    def _refresh_dag_dir(self):
-        """
-        Refresh file paths from dag dir if we haven't done it for too long.
-        """
-        now = timezone.utcnow()
-        elapsed_time_since_refresh = (now - self.last_dag_dir_refresh_time).total_seconds()
-        if elapsed_time_since_refresh > self.dag_dir_list_interval:
-            # Build up a list of Python files that could contain DAGs
-            self.log.info("Searching for files in %s", self._dag_directory)
-            self._file_paths = list_py_file_paths(self._dag_directory)
-            self.last_dag_dir_refresh_time = now
-            self.log.info("There are %s files in %s", len(self._file_paths), self._dag_directory)
-            self.set_file_paths(self._file_paths)
+    def _refresh_dag(self):
+        self.dag_file_manager.update_heartbeat()
+        result = self.dag_file_manager.refresh_all_files()
+        if result[0]:
+            self.set_file_paths(result[1])
+        to_release_file_paths = self.dag_file_manager.release_files()
+        self._release_file_paths(to_release_file_paths)
+        to_add_file_paths = self.dag_file_manager.add_files()
+        self._add_file_paths(to_add_file_paths)
 
-            try:
-                self.log.debug("Removing old import errors")
-                self.clear_nonexistent_import_errors()
-            except Exception:
-                self.log.exception("Error removing old import errors")
+    def _add_file_paths(self, file_paths):
+        if file_paths is None or len(file_paths) == 0:
+            return
+        reset_state_file_paths = []
+        for file_path in file_paths:
+            if file_path not in self._file_paths:
+                reset_state_file_paths.append(file_path)
+                self.file_paths.append(file_path)
+        self.dag_file_manager.reset_state_for_orphaned_tasks(reset_state_file_paths)
 
-            if STORE_SERIALIZED_DAGS:
-                from airflow.models.serialized_dag import SerializedDagModel
-                from airflow.models.dag import DagModel
-                SerializedDagModel.remove_deleted_dags(self._file_paths)
-                DagModel.deactivate_deleted_dags(self._file_paths)
-
-            if STORE_DAG_CODE:
-                from airflow.models.dagcode import DagCode
-                DagCode.remove_deleted_code(self._file_paths)
+    def _release_file_paths(self, file_paths):
+        for file_path in file_paths:
+            if file_path in self._file_paths:
+                self._file_paths.remove(file_path)
+            if file_path in self._file_path_queue:
+                self._file_path_queue.remove(file_path)
+            if file_path in self._processors:
+                self.log.warning("Stopping processor for %s", file_path)
+                Stats.decr('dag_processing.processes')
+                processor = self._processors.pop(file_path)
+                processor.terminate()
+                self._file_stats.pop(file_path)
 
     def _print_stat(self):
         """
@@ -1161,20 +1176,10 @@ class DagFileProcessorManager(LoggingMixin):
         :type new_file_paths: list[unicode]
         :return: None
         """
-        self._file_paths = new_file_paths
-        self._file_path_queue = [x for x in self._file_path_queue
-                                 if x in new_file_paths]
-        # Stop processors that are working on deleted files
-        filtered_processors = {}
-        for file_path, processor in self._processors.items():
-            if file_path in new_file_paths:
-                filtered_processors[file_path] = processor
-            else:
-                self.log.warning("Stopping processor for %s", file_path)
-                Stats.decr('dag_processing.processes')
-                processor.terminate()
-                self._file_stats.pop(file_path)
-        self._processors = filtered_processors
+        to_add_file_paths = set(new_file_paths) - set(self._file_paths)
+        self._add_file_paths(to_add_file_paths)
+        to_release_file_paths = set(self._file_paths) - set(new_file_paths)
+        self._release_file_paths(to_release_file_paths)
 
     def wait_until_finished(self):
         """

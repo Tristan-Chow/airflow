@@ -501,3 +501,28 @@ def render_log_filename(ti, try_number, filename_template):
 
 def convert_camel_to_snake(camel_str):
     return re.sub('(?!^)([A-Z]+)', r'_\1', camel_str).lower()
+
+
+def kill_all_children(log, recursive=False):
+    try:
+        parent = psutil.Process(os.getpid())
+        children = parent.children(recursive=recursive)
+    except psutil.NoSuchProcess:
+        # The process already exited, but maybe it's children haven't.
+        children = []
+        for p in psutil.process_iter():
+            try:
+                if os.getpgid(p.pid) == os.getpid() and p.pid != 0:
+                    children.append(p)
+            except OSError:
+                pass
+    if len(children) == 0:
+        return
+
+    log.info("Try to kill children process: " + str(children))
+    try:
+        subprocess.check_call(
+                    ["kill", "-9", " ".join([str(p.pid) for p in children])]
+                )
+    except subprocess.CalledProcessError:
+        pass
