@@ -326,6 +326,16 @@ def create_master_instance(session=None):
         session.commit()
 
 
+@provide_session
+def create_dsyncer_instance(session=None):
+    from airflow.cluster.nodeinstance import NodeInstance, NODE_INSTANCE_DEAD, INSTANCE_DSYNCER
+    from airflow.cluster.dsyncer import Dsyncer
+    NI = NodeInstance
+    if not session.query(NI).filter(NI.id == Dsyncer.MASTER_ID).first():
+        session.add(NI(id=Dsyncer.MASTER_ID, instance=INSTANCE_DSYNCER, state=NODE_INSTANCE_DEAD))
+        session.commit()
+
+
 def initdb(rbac=False):
     session = settings.Session()
 
@@ -335,6 +345,7 @@ def initdb(rbac=False):
     if conf.getboolean('core', 'LOAD_DEFAULT_CONNECTIONS', fallback=True):
         create_default_connections()
     create_master_instance()
+    create_dsyncer_instance()
     # Known event types
     KET = models.KnownEventType
     if not session.query(KET).filter(KET.know_event_type == 'Holiday').first():

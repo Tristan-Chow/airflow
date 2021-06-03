@@ -190,6 +190,12 @@ def upgrade():
             type_=mysql.TIMESTAMP(fsp=6),
             nullable=True,
         )
+        op.alter_column(
+            table_name="message",
+            column_name="create_date",
+            type_=mysql.TIMESTAMP(fsp=6),
+            nullable=True,
+        )
 
     else:
         # sqlite and mssql datetime are fine as is.  Therefore, not converting
@@ -365,6 +371,12 @@ def upgrade():
             type_=sa.TIMESTAMP(timezone=True),
             nullable=True,
         )
+        op.alter_column(
+            table_name="message",
+            column_name="create_date",
+            type_=sa.TIMESTAMP(timezone=True),
+            nullable=True,
+        )
 
 
 def downgrade():
@@ -499,6 +511,9 @@ def downgrade():
         op.alter_column(
             table_name="node_instance", column_name="latest_heartbeat", type_=mysql.DATETIME(fsp=6), nullable=True,
         )
+        op.alter_column(
+            table_name="message", column_name="create_date", type_=mysql.DATETIME(fsp=6), nullable=True,
+        )
 
     else:
         if conn.dialect.name in ("sqlite", "mssql"):
@@ -608,4 +623,7 @@ def downgrade():
         )
         op.alter_column(
             table_name="node_instance", column_name="latest_heartbeat", type_=sa.DateTime(), nullable=True,
+        )
+        op.alter_column(
+            table_name="message", column_name="create_date", type_=sa.DateTime(), nullable=True,
         )

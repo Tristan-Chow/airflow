@@ -313,6 +313,17 @@ def upgrade():
         op.create_index('ni_instance', 'node_instance', ['instance'], unique=False)
         op.create_index('ni_state', 'node_instance', ['state'], unique=False)
 
+    if 'message' not in tables:
+        op.create_table(
+            'message',
+            sa.Column('id', sa.Integer(), nullable=False),
+            sa.Column('type', sa.String(length=100), nullable=False),
+            sa.Column('content', sa.String(length=2000), nullable=True),
+            sa.Column('create_date', sa.DateTime(), nullable=True),
+            sa.PrimaryKeyConstraint('id')
+        )
+        op.create_index('m_type_id', 'message', ['type', 'id'], unique=False)
+
 
 def downgrade():
     op.drop_table('known_event')
@@ -339,3 +350,4 @@ def downgrade():
     op.drop_table('schedule_plan_tag')
     op.drop_table('dag_file')
     op.drop_table('node_instance')
+    op.drop_table('message')

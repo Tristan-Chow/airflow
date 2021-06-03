@@ -2065,6 +2065,49 @@ def cluster(args):
     dag_file_manager.print_cluster_info()
 
 
+@cli_utils.action_logging
+def dsyncer(args):
+    print(settings.HEADER)
+    from airflow.cluster.dsyncer import Dsyncer, get_dsyncer_instance
+    if args.daemon:
+        pid, stdout, stderr, log_file = setup_locations("dsyncer",
+                                                        args.pid,
+                                                        args.stdout,
+                                                        args.stderr,
+                                                        args.log_file)
+        handle = setup_logging(log_file)
+        stdout = open(stdout, 'w+')
+        stderr = open(stderr, 'w+')
+        ctx = daemon.DaemonContext(
+            pidfile=TimeoutPIDLockFile(pid, -1),
+            files_preserve=[handle],
+            stdout=stdout,
+            stderr=stderr,
+        )
+        with ctx:
+            dsyncer = get_dsyncer_instance()
+            dsyncer.start()
+        stdout.close()
+        stderr.close()
+    else:
+        signal.signal(signal.SIGINT, sigint_handler)
+        signal.signal(signal.SIGTERM, sigint_handler)
+        signal.signal(signal.SIGQUIT, sigquit_handler)
+
+        while True:
+            try:
+                dsyncer = get_dsyncer_instance()
+                dsyncer.start()
+                sys.exit(0)
+            except Exception as e:
+                traceback.print_exc()
+                Dsyncer.TRY_NUMBER += 1
+                if Dsyncer.TRY_NUMBER > 2:
+                    break
+                time.sleep(30)
+        sys.exit(1)
+
+
 class Anonymizer(Protocol):
     """Anonymizer protocol."""
 
@@ -3195,6 +3238,11 @@ class CLIFactory(object):
             'func': cluster,
             'help': "List scheduler cluster information",
             'args': ('path', 'add_path'),
+        },
+        {
+            'func': dsyncer,
+            'help': "Start a dsyncer instance",
+            'args': ('pid', 'daemon', 'stdout', 'stderr', 'log_file'),
         },
     )
     subparsers_dict = {sp['func'].__name__: sp for sp in subparsers}
