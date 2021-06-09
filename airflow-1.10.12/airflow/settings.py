@@ -448,3 +448,9 @@ STORE_DAG_CODE = conf.getboolean("core", "store_dag_code", fallback=STORE_SERIAL
 DONOT_MODIFY_HANDLERS = conf.getboolean('logging', 'donot_modify_handlers', fallback=False)
 
 SCHEDULER_CLUSTER = conf.getboolean("core", "scheduler_cluster")
+
+OPERATOR_RUN_IN_SCHEDULER_SET = \
+    set(conf.get("scheduler", "operators_run_in_scheduler", fallback="").split(","))
+
+if 'SubDagOperator' in OPERATOR_RUN_IN_SCHEDULER_SET:
+    OPERATOR_RUN_IN_SCHEDULER_SET.remove("SubDagOperator")

@@ -32,6 +32,7 @@ import time
 from collections import defaultdict
 from datetime import timedelta
 from time import sleep
+import traceback
 
 from past.builtins import basestring
 import six
@@ -313,6 +314,9 @@ class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingSt
         if self._start_time is None:
             raise AirflowException("Tried to get start time before it started!")
         return self._start_time
+
+
+SCHEDULER_POOL = "scheduler_pool"
 
 
 class SchedulerJob(BaseJob):
@@ -1608,6 +1612,58 @@ class SchedulerJob(BaseJob):
                                      (State.SCHEDULED,))
 
     @provide_session
+    def _run_internal(self, task_instance, run, check_dependencies_met=True, session=None):
+        from airflow.utils.log.logging_mixin import redirect_stdout, redirect_stderr
+
+        task_instance.refresh_from_db(session=session)
+        ti_log_handlers = task_instance.log.handlers
+        root_logger = logging.getLogger()
+        root_logger_handlers = root_logger.handlers
+
+        for handler in root_logger_handlers:
+            root_logger.removeHandler(handler)
+
+        for handler in ti_log_handlers:
+            root_logger.addHandler(handler)
+        root_logger.setLevel(task_instance.log.level)
+        try:
+            task_instance._set_context(task_instance)
+            if check_dependencies_met:
+                dep_context = DepContext(deps=SCHEDULED_DEPS, ignore_task_deps=True)
+                if not task_instance.are_dependencies_met(
+                        dep_context=dep_context,
+                        session=session,
+                        verbose=True):
+                    return
+            self.log.info("Start to run %s directly.", task_instance)
+            task_instance.state = State.RUNNING
+            error = None
+            with redirect_stdout(task_instance.log, logging.INFO), \
+                    redirect_stderr(task_instance.log, logging.WARN):
+                try:
+                    run(task_instance)
+                    self.log.info("Run %s successful in scheduler.", task_instance)
+                except Exception as e1:
+                    error = traceback.format_exc()
+                    task_instance.log.exception(e1)
+                task_instance.log.info("End.\n")
+            if error is not None:
+                self.log.warning("Run %s error inner:\n%s", task_instance, error)
+        except Exception as e2:
+            self.log.exception("Run %s error outer:\n%s", task_instance, e2)
+        finally:
+            for handler in ti_log_handlers:
+                try:
+                    handler.flush()
+                    handler.close()
+                    handler.handler = None
+                except AttributeError:
+                    pass
+                root_logger.removeHandler(handler)
+            for handler in root_logger_handlers:
+                root_logger.addHandler(handler)
+
+    @provide_session
     def process_file(self, file_path, zombies, pickle_dags=False, session=None):
         """
         Process a Python file containing Airflow DAGs.
@@ -1685,10 +1741,16 @@ class SchedulerJob(BaseJob):
 
         self._process_dags(dagbag, dags, ti_keys_to_schedule)
 
+        run_tis = []
+
         for ti_key in ti_keys_to_schedule:
             dag = dagbag.dags[ti_key[0]]
             task = dag.get_task(ti_key[1])
             ti = models.TaskInstance(task, ti_key[2])
+
+            if ti.task.__class__.__name__ in settings.OPERATOR_RUN_IN_SCHEDULER_SET and ti.task.run_in_scheduler:
+                run_tis.append(ti)
+                continue
 
             ti.refresh_from_db(session=session, lock_for_update=True)
             # We check only deps needed to set TI to SCHEDULED state here.
@@ -1703,8 +1765,6 @@ class SchedulerJob(BaseJob):
                     dep_context=dep_context,
                     session=session,
                     verbose=True):
-                # Task starts out in the scheduled state. All tasks in the
-                # scheduled state will be sent to the executor
                 ti.state = State.SCHEDULED
                 # If the task is dummy, then mark it as done automatically
                 if isinstance(ti.task, DummyOperator) \
@@ -1726,6 +1786,13 @@ class SchedulerJob(BaseJob):
             session.merge(ti)
         # commit batch
         session.commit()
+
+        for ti in run_tis:
+            self._run_internal(ti,
+                               lambda task_instance: task_instance.run_in_scheduler(pool=SCHEDULER_POOL,
+                                                                                    session=session),
+                               check_dependencies_met=True,
+                               session=session)
 
         # Record import errors into the ORM
         try:

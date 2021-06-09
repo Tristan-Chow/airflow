@@ -1532,7 +1532,6 @@ def worker(args):
             stderr=stderr,
         )
         with ctx:
-            sp = _serve_logs(env, skip_serve_logs)
             worker.run(**options)
 
         stdout.close()
@@ -1541,12 +1540,7 @@ def worker(args):
         signal.signal(signal.SIGINT, sigint_handler)
         signal.signal(signal.SIGTERM, sigint_handler)
 
-        sp = _serve_logs(env, skip_serve_logs)
-
         worker.run(**options)
-
-    if sp:
-        sp.kill()
 
 
 def initdb(args):  # noqa

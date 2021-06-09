@@ -299,6 +299,7 @@ class BaseOperator(LoggingMixin):
         retry_delay=timedelta(seconds=300),  # type: timedelta
         retry_exponential_backoff=False,  # type: bool
         max_retry_delay=None,  # type: Optional[datetime]
+        run_in_scheduler=True,
         start_date=None,  # type: Optional[datetime]
         end_date=None,  # type: Optional[datetime]
         schedule_interval=None,  # not hooked as of now
@@ -416,6 +417,7 @@ class BaseOperator(LoggingMixin):
         self.task_concurrency = task_concurrency
         self.executor_config = executor_config or {}
         self.do_xcom_push = do_xcom_push
+        self.run_in_scheduler = run_in_scheduler
 
         # Private attributes
         self._upstream_task_ids = set()  # type: Set[str]

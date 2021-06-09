@@ -1085,6 +1085,163 @@ class TaskInstance(Base, LoggingMixin):
             self.log.exception(e)
 
     @provide_session
+    def run_in_scheduler(self, pool=None, test_mode=False, session=None):
+        from airflow.sensors.base_sensor_operator import BaseSensorOperator
+        from airflow.models.renderedtifields import RenderedTaskInstanceFields as RTIF
+
+        task = self.task
+        self.refresh_from_task(task, pool_override=pool)
+        self.job_id = 0
+        self.hostname = get_hostname()
+        if not self.start_date:
+            self.start_date = timezone.utcnow()
+        context = {}
+        actual_start_date = timezone.utcnow()
+        try:
+            context = self.get_template_context()
+            self._try_number += 1
+            task_copy = copy.copy(task)
+
+            if isinstance(task_copy, BaseSensorOperator):
+                task_copy.mode = 'reschedule'
+
+            self.task = task_copy
+
+            def signal_handler(signum, frame):
+                self.log.error("Received SIGTERM. Terminating subprocesses.")
+                task_copy.on_kill()
+                raise AirflowException("Task received SIGTERM signal")
+
+            signal.signal(signal.SIGTERM, signal_handler)
+
+            # Don't clear Xcom until the task is certain to execute
+            self.clear_xcom_data()
+
+            start_time = time.time()
+
+            self.render_templates(context=context)
+            if STORE_SERIALIZED_DAGS:
+                RTIF.write(RTIF(ti=self, render_templates=False))
+                RTIF.delete_old_records(self.task_id, self.dag_id)
+
+            task_copy.pre_execute(context=context)
+
+            # If a timeout is specified for the task, make it fail
+            # if it goes beyond
+            result = None
+            if task_copy.execution_timeout:
+                try:
+                    with timeout(int(task_copy.execution_timeout.total_seconds())):
+                        result = task_copy.execute(context=context)
+                except AirflowTaskTimeout:
+                    task_copy.on_kill()
+                    raise
+            else:
+                result = task_copy.execute(context=context)
+
+            # If the task returns a result, push an XCom containing it
+            if task_copy.do_xcom_push and result is not None:
+                self.xcom_push(key=XCOM_RETURN_KEY, value=result)
+
+            task_copy.post_execute(context=context, result=result)
+
+            end_time = time.time()
+            duration = end_time - start_time
+            Stats.timing(
+                'dag.{dag_id}.{task_id}.duration'.format(
+                    dag_id=task_copy.dag_id,
+                    task_id=task_copy.task_id),
+                duration)
+
+            Stats.incr('operator_successes_{}'.format(
+                self.task.__class__.__name__), 1, 1)
+            Stats.incr('ti_successes')
+            self.state = State.SUCCESS
+        except AirflowSkipException as e:
+            # Recording SKIP
+            # log only if exception has any arguments to prevent log flooding
+            if e.args:
+                self.log.info(e)
+            self.state = State.SKIPPED
+            self.log.info(
+                'Marking task as SKIPPED.'
+                'dag_id=%s, task_id=%s, execution_date=%s, start_date=%s, end_date=%s',
+                self.dag_id,
+                self.task_id,
+                self.execution_date.strftime('%Y%m%dT%H%M%S') if hasattr(
+                    self,
+                    'execution_date') and self.execution_date else '',
+                self.start_date.strftime('%Y%m%dT%H%M%S') if hasattr(
+                    self,
+                    'start_date') and self.start_date else '',
+                self.end_date.strftime('%Y%m%dT%H%M%S') if hasattr(
+                    self,
+                    'end_date') and self.end_date else '')
+        except AirflowRescheduleException as reschedule_exception:
+            self._handle_reschedule(actual_start_date, reschedule_exception, test_mode, context)
+            return
+        except AirflowFailException as e:
+            self.handle_failure(e, test_mode, context, force_fail=True)
+            return
+        except AirflowException as e:
+            # for case when task is marked as success/failed externally
+            # current behavior doesn't hit the success callback
+            if self.state in {State.SUCCESS, State.FAILED}:
+                return
+            else:
+                self.handle_failure(e, test_mode, context)
+                return
+        except (Exception, KeyboardInterrupt) as e:
+            self.log.exception(e)
+            reschedule_date = timezone.utcnow() + \
+                              timedelta(seconds=(self.task.poke_interval
+                                                 if hasattr(self.task, 'poke_interval') else 300))
+            self._handle_reschedule(actual_start_date,
+                                    AirflowRescheduleException(reschedule_date),
+                                    test_mode,
+                                    context)
+            return
+
+        # Success callback
+        try:
+            if task.on_success_callback:
+                task.on_success_callback(context)
+        except Exception as e3:
+            self.log.error("Failed when executing success callback")
+            self.log.exception(e3)
+
+        # Recording SUCCESS
+        self.end_date = timezone.utcnow()
+        self.log.info(
+            'Marking task as SUCCESS.'
+            'dag_id=%s, task_id=%s, execution_date=%s, start_date=%s, end_date=%s',
+            self.dag_id,
+            self.task_id,
+            self.execution_date.strftime('%Y%m%dT%H%M%S') if hasattr(
+                self,
+                'execution_date') and self.execution_date else '',
+            self.start_date.strftime('%Y%m%dT%H%M%S') if hasattr(
+                self,
+                'start_date') and self.start_date else '',
+            self.end_date.strftime('%Y%m%dT%H%M%S') if hasattr(
+                self,
+                'end_date') and self.end_date else '')
+
+        self.set_duration()
+        if not test_mode:
+            session.add(Log(self.state, self))
+            session.merge(self)
+        session.commit()
+
+        try:
+            event = event_action.TI_SUCCESS
+            event_action.do_ti_action(event, task, self, context)
+        except Exception as e:
+            self.log.error('Executing event action error for %s.%s.%s',
+                           self.dag_id, self.task_id, self.execution_date)
+            self.log.exception(e)
+
+    @provide_session
     def run(
             self,
             verbose=True,
