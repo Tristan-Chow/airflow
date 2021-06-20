@@ -27,6 +27,7 @@ from airflow.models.serialized_dag import SerializedDagModel
 from airflow.utils.db import provide_session
 from airflow.exceptions import DagNotFound
 from airflow.settings import STORE_SERIALIZED_DAGS
+from airflow.models.simpledag import SimpleDagModel
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +66,8 @@ def delete_dag(dag_id, keep_records_in_log=True, session=None):
         for model in models.DagRun, TaskFail, models.TaskInstance:
             count += session.query(model).filter(model.dag_id == parent_dag_id,
                                                  model.task_id == task_id).delete()
-
+    count += session.query(SimpleDagModel)\
+        .filter(SimpleDagModel.dag_id == dag_id).delete()
     # Delete entries in Import Errors table for a deleted DAG
     # This handles the case when the dag_id is changed in the file
     session.query(models.ImportError).filter(

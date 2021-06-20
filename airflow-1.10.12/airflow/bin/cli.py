@@ -2102,6 +2102,25 @@ def dsyncer(args):
         sys.exit(1)
 
 
+def leader(args):
+    print(settings.HEADER)
+    from airflow.cluster.nodeinstance import NodeInstance as NI
+    from airflow.utils import timezone
+    leader = NI.select(id=jobs.SchedulerJob.MASTER_ID)
+
+    def parse_datetime(value):
+        if value is None:
+            return "None"
+        i = (timezone.utcnow() - value).total_seconds()
+        return value.strftime('%Y-%m-%d %H:%M:%S') if i > 30 else "{} seconds ago".format(int(i))
+
+    print("Leader information:")
+    print(tabulate([[leader.id, leader.hostname, leader.state, parse_datetime(leader.start_date),
+                     parse_datetime(leader.latest_heartbeat),
+                     ]],
+                   headers=['id', 'hostname', 'state', 'start_date', 'latest_heartbeat'], tablefmt="fancy_grid"))
+
+
 class Anonymizer(Protocol):
     """Anonymizer protocol."""
 
@@ -3238,6 +3257,11 @@ class CLIFactory(object):
             'help': "Start a dsyncer instance",
             'args': ('pid', 'daemon', 'stdout', 'stderr', 'log_file'),
         },
+        {
+            'func': leader,
+            'help': "List scheduler leader role information.",
+            'args': (),
+        }
     )
     subparsers_dict = {sp['func'].__name__: sp for sp in subparsers}
     dag_subparsers = (

@@ -33,7 +33,10 @@ from airflow.cluster.nodeinstance import NodeInstance, NODE_INSTANCE_DEAD, NODE_
                                          INSTANCE_MASTER, INSTANCE_SCHEDULER
 from airflow.cluster.dag_file import DagFile, DAG_FILE_READY, DAG_FILE_ASSIGNED, DAG_FILE_RELEASE, DAG_FILE_SCHEDULED, \
                                      get_df_upsert_function
+
 from airflow.utils.helpers import kill_all_children
+from airflow import settings
+
 
 DF = DagFile
 NI = NodeInstance
@@ -418,7 +421,8 @@ class DbDagFileManager(BaseDagFileManager):
             if self.base_job is None:
                 from airflow.jobs.base_job import BaseJob
                 self.base_job = BaseJob()
-            self.base_job.reset_state_for_orphaned_tasks(dag_ids=dag_ids)
+            if not settings.GLOBAL_SCHEDULE_MODE:
+                self.base_job.reset_state_for_orphaned_tasks(dag_ids=dag_ids)
 
     @provide_session
     def print_path_info(self, fileloc, session=None):

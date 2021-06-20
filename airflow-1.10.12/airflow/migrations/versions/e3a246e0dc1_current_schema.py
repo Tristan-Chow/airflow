@@ -24,7 +24,7 @@ Revises:
 Create Date: 2015-08-18 16:35:00.883495
 
 """
-
+import dill
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy import func
@@ -324,6 +324,18 @@ def upgrade():
         )
         op.create_index('m_type_id', 'message', ['type', 'id'], unique=False)
 
+    if 'simple_dag' not in tables:
+        op.create_table(
+            'simple_dag',
+            sa.Column('dag_id', sa.String(length=250), nullable=False),
+            sa.Column('task_ids', sa.PickleType(pickler=dill)),
+            sa.Column('full_filepath', sa.String(length=2000), nullable=True),
+            sa.Column('concurrency', sa.Integer(), nullable=True),
+            sa.Column('pickle_id', sa.Integer(), nullable=True),
+            sa.Column('task_special_args', sa.PickleType(pickler=dill)),
+            sa.PrimaryKeyConstraint('dag_id')
+        )
+
 
 def downgrade():
     op.drop_table('known_event')
@@ -351,3 +363,4 @@ def downgrade():
     op.drop_table('dag_file')
     op.drop_table('node_instance')
     op.drop_table('message')
+    op.drop_table('simple_dag')

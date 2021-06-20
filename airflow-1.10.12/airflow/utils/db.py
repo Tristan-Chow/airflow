@@ -335,6 +335,15 @@ def create_dsyncer_instance(session=None):
         session.add(NI(id=Dsyncer.MASTER_ID, instance=INSTANCE_DSYNCER, state=NODE_INSTANCE_DEAD))
         session.commit()
 
+@provide_session
+def create_scheduler_leader_instance(session=None):
+    from airflow.cluster.nodeinstance import NodeInstance, NODE_INSTANCE_DEAD, INSTANCE_SCHEDULER_LEADER
+    from airflow.jobs.scheduler_job import SchedulerJob
+    NI = NodeInstance
+    if not session.query(NI).filter(NI.id == SchedulerJob.MASTER_ID).first():
+        session.add(NI(id=SchedulerJob.MASTER_ID, instance=INSTANCE_SCHEDULER_LEADER, state=NODE_INSTANCE_DEAD))
+        session.commit()
+
 
 def initdb(rbac=False):
     session = settings.Session()
@@ -346,6 +355,7 @@ def initdb(rbac=False):
         create_default_connections()
     create_master_instance()
     create_dsyncer_instance()
+    create_scheduler_leader_instance()
     # Known event types
     KET = models.KnownEventType
     if not session.query(KET).filter(KET.know_event_type == 'Holiday').first():

@@ -62,6 +62,8 @@ from airflow.utils.mixins import MultiprocessingStartMethodMixin
 from airflow.utils.log.logging_mixin import LoggingMixin, StreamLogWriter, set_context
 from airflow.utils.state import State
 from airflow import event_action
+from airflow.models.simpledag import SimpleDagModel
+from airflow.cluster.nodeinstance import NodeInstance, INSTANCE_SCHEDULER_LEADER, NODE_INSTANCE_DEAD
 
 
 class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingStartMethodMixin):
@@ -345,7 +347,7 @@ class SchedulerJob(BaseJob):
         file, whether to serialize the DAG object to the DB
     :type do_pickle: bool
     """
-
+    MASTER_ID = 3
     __mapper_args__ = {
         'polymorphic_identity': 'SchedulerJob'
     }
@@ -417,6 +419,11 @@ class SchedulerJob(BaseJob):
                                             'run_duration')
 
         self.processor_agent = None
+        self.is_leader = False
+        self.node = None
+        self.ignore_pool = [SCHEDULER_POOL]
+        self.parallelism = self.executor.parallelism
+        self.last_check_abnormal_state = timezone.datetime(2000, 1, 1)
 
         signal.signal(signal.SIGINT, self._exit_gracefully)
         signal.signal(signal.SIGTERM, self._exit_gracefully)
@@ -868,6 +875,7 @@ class SchedulerJob(BaseJob):
                                              simple_dag_bag,
                                              old_states,
                                              new_state,
+                                             check_all=False,
                                              session=None):
         """
         For all DAG IDs in the SimpleDagBag, look for task instances in the
@@ -888,13 +896,15 @@ class SchedulerJob(BaseJob):
         query = session \
             .query(models.TaskInstance) \
             .outerjoin(models.DagRun, and_(
-                models.TaskInstance.dag_id == models.DagRun.dag_id,
-                models.TaskInstance.execution_date == models.DagRun.execution_date)) \
-            .filter(models.TaskInstance.dag_id.in_(simple_dag_bag.dag_ids)) \
+               models.TaskInstance.dag_id == models.DagRun.dag_id,
+               models.TaskInstance.execution_date == models.DagRun.execution_date)) \
             .filter(models.TaskInstance.state.in_(old_states)) \
             .filter(or_(
                 models.DagRun.state != State.RUNNING,
                 models.DagRun.state.is_(None)))
+        if not check_all:
+            query.filter(models.TaskInstance.dag_id.in_(simple_dag_bag.dag_ids))
+
         # We need to do this for mysql as well because it can cause deadlocks
         # as discussed in https://issues.apache.org/jira/browse/AIRFLOW-2516
         if self.using_sqlite:
@@ -951,6 +961,282 @@ class SchedulerJob(BaseJob):
             dag_map[dag_id] += count
             task_map[(dag_id, task_id)] = count
         return dag_map, task_map
+
+    @provide_session
+    def _find_executable_task_instances_by_orm(self, states, session=None):
+        from airflow.jobs.backfill_job import BackfillJob  # Avoid circular import
+        simple_dag_bag = SimpleDagBag([])
+        executable_tis = []
+
+        TI = models.TaskInstance
+        DR = models.DagRun
+        DM = models.DagModel
+
+        ti_query = (
+            session
+                .query(TI.pool, func.count('*'))
+                .outerjoin(
+                DR,
+                and_(DR.dag_id == TI.dag_id, DR.execution_date == TI.execution_date))
+                .filter(not_(TI.pool.in_(self.ignore_pool)))
+                .filter(or_(DR.run_id == None,  # noqa: E711 pylint: disable=singleton-comparison
+                            not_(DR.run_id.like(BackfillJob.ID_PREFIX + '%'))))
+                .filter(DR.state == State.RUNNING)
+                .outerjoin(DM, DM.dag_id == TI.dag_id)
+                .filter(or_(DM.dag_id == None,  # noqa: E711 pylint: disable=singleton-comparison
+                            not_(DM.is_paused)))
+                .group_by(TI.pool)
+        )
+
+        # Additional filters on task instance state
+        if None in states:
+            ti_query = ti_query.filter(
+                or_(TI.state == None, TI.state.in_(states))  # noqa: E711 pylint: disable=singleton-comparison
+            )
+        else:
+            ti_query = ti_query.filter(TI.state.in_(states))
+
+        task_instances_to_examine = {pool: count for pool, count in ti_query.all()}
+
+        if len(task_instances_to_examine) == 0:
+            self.log.debug("No tasks to consider for execution.")
+            return simple_dag_bag, executable_tis
+
+        remain_count = self.max_tis_per_query
+        if self.parallelism:
+            running_count = session.query(func.count('*')) \
+                .filter(TI.state.in_(STATES_TO_COUNT_AS_RUNNING)) \
+                .filter(not_(TI.pool.in_(self.ignore_pool))) \
+                .first()[0]
+            remain_count = min(self.parallelism - running_count, remain_count)
+            if remain_count <= 0:
+                self.log.info(
+                    "Not scheduling since there are %s in running, and remain slots are %s",
+                    running_count, remain_count
+                )
+                return simple_dag_bag, executable_tis
+
+        pools = {p.pool: p.slots for p in session.query(models.Pool)
+            .filter(models.Pool.pool.in_(task_instances_to_examine.keys()))
+            .all()}
+
+        pool_slots = {}
+        for pool, count in task_instances_to_examine.items():
+            if pool not in pools:
+                self.log.warning(
+                    "Tasks using non-existent pool '%s' will not be scheduled",
+                    pool
+                )
+                continue
+            pool_slots[pool] = pools[pool]
+
+        if len(pool_slots) == 0:
+            return simple_dag_bag, executable_tis
+
+        pool_occupied_slots = {pool: occupied_slots
+                               for pool, occupied_slots in session.query(TI.pool, func.sum(TI.pool_slots))
+                               .filter(TI.pool.in_(pool_slots.keys()))
+                               .filter(TI.state.in_(STATES_TO_COUNT_AS_RUNNING))
+                               .group_by(TI.pool)
+                               .all()}
+
+        pool_open_slots = {pool: slots - pool_occupied_slots.get(pool, 0)
+                           for pool, slots in pool_slots.items()}
+
+        have_remain_slots_pool = {}
+        for pool, open_slots in pool_open_slots.items():
+            if open_slots <= 0:
+                self.log.info(
+                    "Not scheduling since there are %s open slots in pool %s",
+                    open_slots, pool
+                )
+                continue
+            have_remain_slots_pool[pool] = open_slots
+
+        if len(have_remain_slots_pool) == 0:
+            return simple_dag_bag, executable_tis
+
+        # dag_id to # of running tasks and (dag_id, task_id) to # of running tasks.
+        dag_concurrency_map, task_concurrency_map = self.__get_concurrency_maps(
+            states=STATES_TO_COUNT_AS_RUNNING, session=session)
+
+        slots_used_rate = [(pool, int(pool_occupied_slots.get(pool, 0)) * 1.0 / pool_slots[pool])
+                      for pool, _ in have_remain_slots_pool.items()]
+
+        slots_used_rate = sorted(slots_used_rate, key=lambda rate: rate[1])
+
+        pools_usable_count = defaultdict(int)
+        fix_pools = []
+
+        def assigned_slots(count):
+            for i in range(0, count):
+                if len(slots_used_rate) == 0:
+                    break
+                pool, _ = slots_used_rate[0]
+                pools_usable_count[pool] += 1
+                task_instances_to_examine[pool] -= 1
+                have_remain_slots_pool[pool] -= - 1
+                rate = 1.0 * (pools_usable_count[pool] + int(pool_occupied_slots.get(pool, 0))) / pool_slots[pool]
+                if task_instances_to_examine[pool] == 0 or have_remain_slots_pool[pool] == 0:
+                    fix_pools.append((pool, rate))
+                    slots_used_rate.pop(0)
+                    continue
+                slots_used_rate[0] = (pool, rate)
+                for i in range(0, len(slots_used_rate) - 1):
+                    if slots_used_rate[i][1] > slots_used_rate[i+1][1]:
+                        slots_used_rate[i], slots_used_rate[i+1] = slots_used_rate[i+1], slots_used_rate[i]
+                    else:
+                        break
+        assigned_slots(remain_count)
+        simple_dag_cache = {}
+
+        while True:
+            if len(fix_pools) == 0:
+                if len(slots_used_rate) == 0:
+                    break
+                fix_pools.append(slots_used_rate.pop(0))
+            pool, _ = fix_pools.pop(0)
+            usable_count = pools_usable_count[pool]
+            watermark = None
+            open_slots = pool_open_slots[pool]
+            skip = False
+            while usable_count > 0:
+                limit = max(16, usable_count)
+                tis = self.find_scheduled_task_instances(pool, states, limit, session, watermark=watermark)
+                if len(tis) == 0:
+                    break
+                dag_ids = set([ti.dag_id for ti in tis if ti.dag_id not in simple_dag_cache])
+                if len(dag_ids) != 0:
+                    SDM = SimpleDagModel
+                    simple_dag_models = session.query(SimpleDagModel) \
+                        .filter(SDM.dag_id.in_(dag_ids)).all()
+                    for simple_dag_model in simple_dag_models:
+                        simple_dag = SimpleDag(simple_dag_model=simple_dag_model)
+                        simple_dag_cache[simple_dag.dag_id] = simple_dag
+                for ti in tis:
+                    simple_dag = simple_dag_cache.get(ti.dag_id, None)
+                    if simple_dag is None or not os.path.exists(simple_dag.full_filepath):
+                        ti.state = None
+                        session.merge(ti)
+                        continue
+                    if ti.pool_slots > open_slots:
+                        self.log.info("Not executing %s since it requires %s slots "
+                                      "but there are %s open slots in the pool %s.",
+                                      ti, ti.pool_slots, open_slots, pool)
+                        continue
+                    current_dag_concurrency = dag_concurrency_map[ti.dag_id]
+                    dag_concurrency_limit = simple_dag_cache[ti.dag_id].concurrency
+                    self.log.info(
+                        "DAG %s has %s/%s running and queued tasks",
+                        ti.dag_id, current_dag_concurrency, dag_concurrency_limit
+                    )
+                    if current_dag_concurrency >= dag_concurrency_limit:
+                        self.log.info(
+                            "Not executing %s since the number of tasks running or queued "
+                            "from DAG %s is >= to the DAG's task concurrency limit of %s",
+                            ti, ti.dag_id, dag_concurrency_limit
+                        )
+                        continue
+
+                    task_concurrency_limit = simple_dag.get_task_special_arg(
+                        ti.task_id,
+                        'task_concurrency')
+                    if task_concurrency_limit is not None:
+                        current_task_concurrency = task_concurrency_map[
+                            (ti.dag_id, ti.task_id)
+                        ]
+
+                        if current_task_concurrency >= task_concurrency_limit:
+                            self.log.info("Not executing %s since the task concurrency for"
+                                          " this task has been reached.", ti)
+                            continue
+
+                    if self.executor.has_task(ti):
+                        self.log.debug(
+                            "Not handling task %s as the executor reports it is running",
+                            ti.key
+                        )
+                        continue
+                    usable_count -= 1
+                    executable_tis.append(ti)
+                    open_slots -= ti.pool_slots
+                    dag_concurrency_map[ti.dag_id] += 1
+                    task_concurrency_map[(ti.dag_id, ti.task_id)] += 1
+                    if open_slots <= 0:
+                        self.log.info(
+                            "Not scheduling since there are %s open slots in pool %s",
+                            open_slots, pool
+                        )
+                        skip = True
+                        break
+                    if usable_count <= 0:
+                        skip = True
+                        break
+                session.commit()
+                if skip or len(tis) < limit:
+                    break
+                watermark = tis[-1].priority_weight, tis[-1].execution_date, tis[-1].task_id, tis[-1].dag_id
+            assigned_slots(usable_count)
+        task_instance_str = "\n\t".join(
+            [repr(x) for x in executable_tis])
+        self.log.info(
+            "Setting the following tasks to queued state:\n\t%s", task_instance_str)
+        # so these dont expire on commit
+        for ti in executable_tis:
+            copy_dag_id = ti.dag_id
+            copy_execution_date = ti.execution_date
+            copy_task_id = ti.task_id
+            make_transient(ti)
+            ti.dag_id = copy_dag_id
+            ti.execution_date = copy_execution_date
+            ti.task_id = copy_task_id
+        return SimpleDagBag(simple_dag_cache.values()), executable_tis
+
+    def find_scheduled_task_instances(self, pool, states, limit, session, watermark=None):
+        from airflow.jobs.backfill_job import BackfillJob  # Avoid circular import
+        TI = models.TaskInstance
+        DR = models.DagRun
+        DM = models.DagModel
+
+        ti_qry = (
+            session
+                .query(TI)
+                .filter(TI.pool == pool)
+                .outerjoin(
+                    DR,
+                    and_(DR.dag_id == TI.dag_id, DR.execution_date == TI.execution_date)
+                )
+                .filter(or_(DR.run_id == None,  # noqa: E711 pylint: disable=singleton-comparison
+                            not_(DR.run_id.like(BackfillJob.ID_PREFIX + '%'))))
+                .filter(DR.state == State.RUNNING)
+                .outerjoin(DM, DM.dag_id == TI.dag_id)
+                .filter(or_(DM.dag_id == None,  # noqa: E711 pylint: disable=singleton-comparison
+                            not_(DM.is_paused)))
+        )
+
+        # Additional filters on task instance state
+        if None in states:
+            ti_qry = ti_qry.filter(
+                or_(TI.state == None, TI.state.in_(states))  # noqa: E711 pylint: disable=singleton-comparison
+            )
+        else:
+            ti_qry = ti_qry.filter(TI.state.in_(states))
+
+        if watermark is not None:
+            priority_weight, execution_date, task_id, dag_id = watermark
+            ti_qry = ti_qry.filter(or_(TI.priority_weight < priority_weight,
+                                       and_(TI.priority_weight == priority_weight,
+                                            or_(TI.execution_date > execution_date,
+                                                and_(TI.execution_date == execution_date,
+                                                     or_(TI.task_id > task_id,
+                                                         and_(TI.task_id == task_id,
+                                                              TI.dag_id > dag_id)))))))
+        ti_qry = ti_qry.order_by(TI.priority_weight.desc(),
+                                 TI.execution_date.asc(),
+                                 TI.task_id.asc(),
+                                 TI.dag_id.asc())
+        ti_qry = ti_qry.limit(limit)
+        return ti_qry.all()
 
     @provide_session
     def _find_executable_task_instances(self, simple_dag_bag, states, session=None):
@@ -1255,6 +1541,7 @@ class SchedulerJob(BaseJob):
     def _execute_task_instances(self,
                                 simple_dag_bag,
                                 states,
+                                by_orm=False,
                                 session=None):
         """
         Attempts to execute TaskInstances that should be executed by the scheduler.
@@ -1272,8 +1559,11 @@ class SchedulerJob(BaseJob):
         :type states: tuple[airflow.utils.state.State]
         :return: Number of task instance with state changed.
         """
-        executable_tis = self._find_executable_task_instances(simple_dag_bag, states,
-                                                              session=session)
+        if by_orm:
+            simple_dag_bag, executable_tis = self._find_executable_task_instances_by_orm(states)
+        else:
+            executable_tis = self._find_executable_task_instances(simple_dag_bag, states,
+                                                                  session=session)
 
         def query(result, items):
             simple_tis_with_state_changed = \
@@ -1368,14 +1658,23 @@ class SchedulerJob(BaseJob):
                 self.manage_slas(dag)
 
     @provide_session
-    def _process_executor_events(self, simple_dag_bag, session=None):
+    def get_simple_dag_by_orm(self, dag_id, session=None):
+        simple_dag_model = session.query(SimpleDagModel) \
+            .filter(SimpleDagModel.dag_id == dag_id).first()
+        if simple_dag_model is None:
+            return None
+        return SimpleDag(simple_dag_model=simple_dag_model)
+
+    @provide_session
+    def _process_executor_events(self, simple_dag_bag, session=None, get_simple_dag=None):
         """
         Respond to executor events.
         """
         # TODO: this shares quite a lot of code with _manage_executor_state
 
         TI = models.TaskInstance
-        for key, state in list(self.executor.get_event_buffer(simple_dag_bag.dag_ids)
+        for key, state in list(self.executor.get_event_buffer(
+            simple_dag_bag.dag_ids if get_simple_dag is None else None)
                                    .items()):
             dag_id, task_id, execution_date, try_number = key
             self.log.info(
@@ -1400,7 +1699,10 @@ class SchedulerJob(BaseJob):
                     Stats.incr('scheduler.tasks.killed_externally')
                     self.log.error(msg)
                     try:
-                        simple_dag = simple_dag_bag.get_dag(dag_id)
+                        if get_simple_dag is not None:
+                            simple_dag = get_simple_dag(dag_id, session=session)
+                        else:
+                            simple_dag = simple_dag_bag.get_dag(dag_id)
                         dagbag = models.DagBag(simple_dag.full_filepath)
                         dag = dagbag.get_dag(dag_id)
                         ti.task = dag.get_task(task_id)
@@ -1453,6 +1755,7 @@ class SchedulerJob(BaseJob):
             self.log.exception("Exception when executing execute_helper")
         finally:
             self.processor_agent.end()
+            self.log_out()
             self.log.info("Exited execute loop")
 
     @staticmethod
@@ -1467,6 +1770,51 @@ class SchedulerJob(BaseJob):
 
     def _get_simple_dags(self):
         return self.processor_agent.harvest_simple_dags()
+
+    @provide_session
+    def registry_or_update_heartbeat(self, session=None):
+        if self.is_leader:
+            node = NodeInstance.select(self.node.id, lock_for_update=True)
+            if node.hostname != self.node.hostname:
+                session.commit()
+                self.is_leader = False
+                self.node = None
+                self.executor.end()
+                return
+            self.node.latest_heartbeat = timezone.utcnow()
+            session.merge(self.node)
+            session.commit()
+        else:
+            node = NodeInstance.select(id=SchedulerJob.MASTER_ID, session=session)
+
+            if NodeInstance.check_node_alive(node, timeout=60):
+                session.commit()
+                return
+
+            node = NodeInstance.select(id=SchedulerJob.MASTER_ID, lock_for_update=True, session=session)
+            if NodeInstance.check_node_alive(node, timeout=60):
+                session.commit()
+                return
+
+            self.node = NodeInstance.create_instance(id=SchedulerJob.MASTER_ID, instance=INSTANCE_SCHEDULER_LEADER)
+            session.merge(self.node)
+            session.commit()
+            self.is_leader = True
+            self.reset_state_for_orphaned_tasks(session=session)
+            self.executor = self.executor.__class__()
+            self.executor.start()
+            self.executor.parallelism = 0
+            return
+
+    @provide_session
+    def log_out(self, session=None):
+        if self.is_leader:
+            node = NodeInstance.select(self.node.id, lock_for_update=True)
+            if node.hostname == self.node.hostname:
+                node.state = NODE_INSTANCE_DEAD
+                session.merge(node)
+                session.commit()
+            self.log.info("Logout success")
 
     def _execute_helper(self):
         """
@@ -1520,7 +1868,12 @@ class SchedulerJob(BaseJob):
             # Send tasks for execution if available
             simple_dag_bag = SimpleDagBag(simple_dags)
 
-            if not self._validate_and_run_task_instances(simple_dag_bag=simple_dag_bag):
+            if settings.GLOBAL_SCHEDULE_MODE:
+                self.registry_or_update_heartbeat()
+                if self.is_leader:
+                    if not self._validate_and_run_task_instances_by_orm():
+                        continue
+            elif not self._validate_and_run_task_instances(simple_dag_bag=simple_dag_bag):
                 continue
 
             # Heartbeat the scheduler periodically
@@ -1534,7 +1887,7 @@ class SchedulerJob(BaseJob):
             is_unit_test = conf.getboolean('core', 'unit_test_mode')
             loop_end_time = time.time()
             loop_duration = loop_end_time - loop_start_time
-            self.log.debug(
+            self.log.info(
                 "Ran scheduling loop in %.2f seconds",
                 loop_duration)
 
@@ -1588,6 +1941,66 @@ class SchedulerJob(BaseJob):
 
         # Process events from the executor
         self._process_executor_events(simple_dag_bag)
+        return True
+
+    @provide_session
+    def change_abnormal_queued_state_taskinstance(self, session=None):
+        TI = models.TaskInstance
+        keys = session.query(TI.dag_id, TI.task_id, TI.execution_date).filter(TI.state == State.QUEUED).all()
+        if len(keys) == 0:
+            return
+        running_keys = set()
+        for key, _ in self.executor.running.items():
+            dag_id = key[0]
+            task_id = key[1]
+            execution_date = key[2]
+            running_keys.add((dag_id, task_id, execution_date))
+        for key in keys:
+            if key not in running_keys:
+                dag_id, task_id, execution_date = key
+                ti = session.query(TI).filter(
+                    TI.dag_id == dag_id,
+                    TI.task_id == task_id,
+                    TI.execution_date == execution_date) \
+                    .with_for_update().populate_existing().first()
+                if ti.state == State.QUEUED:
+                    ti.state = None
+                    session.merge(ti)
+                session.commit()
+
+    def _validate_and_run_task_instances_by_orm(self):
+        simple_dag_bag = SimpleDagBag([])
+        try:
+            if (timezone.utcnow() - self.last_check_abnormal_state).total_seconds() > 60:
+                self.change_abnormal_queued_state_taskinstance()
+                self._change_state_for_tis_without_dagrun(simple_dag_bag,
+                                                          [State.UP_FOR_RETRY],
+                                                          State.FAILED,
+                                                          check_all=True)
+                self._change_state_for_tis_without_dagrun(simple_dag_bag,
+                                                          [State.QUEUED,
+                                                           State.SCHEDULED,
+                                                           State.UP_FOR_RESCHEDULE],
+                                                          State.NONE,
+                                                          check_all=True)
+                self.last_check_abnormal_state = timezone.utcnow()
+
+            self._execute_task_instances(simple_dag_bag,
+                                         (State.SCHEDULED,),
+                                         by_orm=True)
+        except Exception as e:
+            self.log.error("Error queuing tasks")
+            self.log.exception(e)
+            return False
+
+        # Call heartbeats
+        self.log.debug("Heartbeating the executor")
+        self.executor.heartbeat()
+
+        self._change_state_for_tasks_failed_to_execute()
+
+        # Process events from the executor
+        self._process_executor_events(simple_dag_bag, get_simple_dag=self.get_simple_dag_by_orm)
         return True
 
     def _process_and_execute_tasks(self, simple_dag_bag):
@@ -1694,20 +2107,20 @@ class SchedulerJob(BaseJob):
         self.log.info("Processing file %s for tasks to queue", file_path)
         # As DAGs are parsed from this file, they will be converted into SimpleDags
         simple_dags = []
-
+        found_dag_count = 0
         try:
             dagbag = models.DagBag(file_path, include_examples=False)
         except Exception:
             self.log.exception("Failed at reloading the DAG file %s", file_path)
             Stats.incr('dag_file_refresh_error', 1, 1)
-            return [], []
+            return simple_dags, found_dag_count, 0
 
         if len(dagbag.dags) > 0:
             self.log.info("DAG(s) %s retrieved from %s", dagbag.dags.keys(), file_path)
         else:
             self.log.warning("No viable dags retrieved from %s", file_path)
             self.update_import_errors(session, dagbag)
-            return [], len(dagbag.import_errors)
+            return simple_dags, found_dag_count, len(dagbag.import_errors)
 
         # Save individual DAGs in the ORM and update DagModel.last_scheduled_time
         for dag in dagbag.dags.values():
@@ -1723,7 +2136,15 @@ class SchedulerJob(BaseJob):
                 pickle_id = None
                 if pickle_dags:
                     pickle_id = dag.pickle(session).id
-                simple_dags.append(SimpleDag(dag, pickle_id=pickle_id))
+                simple_dag = SimpleDag(dag, pickle_id=pickle_id)
+                found_dag_count += 1
+                if settings.GLOBAL_SCHEDULE_MODE:
+                    SimpleDagModel.sync_to_db(simple_dag)
+                else:
+                    simple_dags.append(simple_dag)
+
+        if paused_dag_ids is not None and len(paused_dag_ids) > 0:
+            SimpleDagModel.delete(paused_dag_ids)
 
         if len(self.dag_ids) > 0:
             dags = [dag for dag in dagbag.dags.values()
@@ -1810,7 +2231,7 @@ class SchedulerJob(BaseJob):
             except Exception:
                 self.log.exception("Error manage dag notify_slas for %s!", dag.dag_id)
 
-        return simple_dags, len(dagbag.import_errors)
+        return simple_dags, found_dag_count, len(dagbag.import_errors)
 
     @provide_session
     def heartbeat_callback(self, session=None):

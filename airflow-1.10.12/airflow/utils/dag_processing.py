@@ -75,19 +75,27 @@ class SimpleDag(BaseDag):
     :type pickle_id: unicode
     """
 
-    def __init__(self, dag, pickle_id=None):
-        self._dag_id = dag.dag_id
-        self._task_ids = [task.task_id for task in dag.tasks]
-        self._full_filepath = dag.full_filepath
-        self._concurrency = dag.concurrency
-        self._pickle_id = pickle_id
-        self._task_special_args = {}
-        for task in dag.tasks:
-            special_args = {}
-            if task.task_concurrency is not None:
-                special_args['task_concurrency'] = task.task_concurrency
-            if len(special_args) > 0:
-                self._task_special_args[task.task_id] = special_args
+    def __init__(self, dag=None, pickle_id=None, simple_dag_model=None):
+        if simple_dag_model is not None:
+            self._dag_id = simple_dag_model.dag_id
+            self._task_ids = simple_dag_model.task_ids
+            self._full_filepath = simple_dag_model.full_filepath
+            self._concurrency = simple_dag_model.concurrency
+            self._pickle_id = simple_dag_model.pickle_id
+            self._task_special_args = simple_dag_model.task_special_args
+        elif dag is not None:
+            self._dag_id = dag.dag_id
+            self._task_ids = [task.task_id for task in dag.tasks]
+            self._full_filepath = dag.full_filepath
+            self._concurrency = dag.concurrency
+            self._pickle_id = pickle_id
+            self._task_special_args = {}
+            for task in dag.tasks:
+                special_args = {}
+                if task.task_concurrency is not None:
+                    special_args['task_concurrency'] = task.task_concurrency
+                if len(special_args) > 0:
+                    self._task_special_args[task.task_id] = special_args
 
     @property
     def dag_id(self):
@@ -1212,8 +1220,8 @@ class DagFileProcessorManager(LoggingMixin):
                 finished_processors[file_path] = processor
 
                 stat = DagFileStat(
-                    len(processor.result[0]) if processor.result is not None else 0,
-                    processor.result[1] if processor.result is not None else -1,
+                    processor.result[1] if processor.result is not None else 0,
+                    processor.result[2] if processor.result is not None else -1,
                     now,
                     (now - processor.start_time).total_seconds(),
                     self.get_run_count(file_path) + 1,

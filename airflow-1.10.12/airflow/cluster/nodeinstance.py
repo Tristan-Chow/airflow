@@ -31,6 +31,7 @@ NODE_INSTANCE_RUNNING = 'running'
 INSTANCE_MASTER = 'master'
 INSTANCE_SCHEDULER = 'scheduler'
 INSTANCE_DSYNCER = 'dsyncer'
+INSTANCE_SCHEDULER_LEADER = 'scheduler_leader'
 
 
 class NodeInstance(Base):
