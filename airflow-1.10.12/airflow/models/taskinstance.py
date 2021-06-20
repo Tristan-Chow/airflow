@@ -36,7 +36,7 @@ import pendulum
 import six
 from six.moves.urllib.parse import quote_plus
 from jinja2 import TemplateAssertionError, UndefinedError
-from sqlalchemy import Column, Float, Index, Integer, PickleType, String, func, desc
+from sqlalchemy import Column, Float, Index, Integer, PickleType, String, func, desc, and_, or_
 from sqlalchemy.orm import reconstructor
 from sqlalchemy.orm.session import Session
 
@@ -68,7 +68,7 @@ from airflow.utils.state import State
 from airflow.utils.timeout import timeout
 from airflow import event_action
 from airflow.api.client.job_client import job_client
-
+from airflow.cluster.message import Message, TYPE_TASK_RUNNING, make_task_running_content
 
 def clear_task_instances(tis,
                          session,
@@ -891,6 +891,10 @@ class TaskInstance(Base, LoggingMixin):
         self.end_date = None
         if not test_mode:
             session.merge(self)
+            Message.add(TYPE_TASK_RUNNING, make_task_running_content(self.dag_id,
+                                                                     self.task_id,
+                                                                     self.execution_date,
+                                                                     self.try_number))
         session.commit()
 
         # Closing all pooled connections to prevent
@@ -1778,3 +1782,30 @@ class TaskInstance(Base, LoggingMixin):
         Refreshes the task instance from RestAPI
         """
         job_client.get_task_info(self)
+
+    @staticmethod
+    @provide_session
+    def find_queued_tis(tasks, session=None):
+        ti_query = session.query(TaskInstance).filter(TaskInstance.state == State.QUEUED)
+        if len(tasks) > 0:
+            filter_for_ti_state = (
+                [and_(
+                    TaskInstance.dag_id == dag_id,
+                    TaskInstance.task_id == task_id,
+                    TaskInstance.execution_date == execution_date)
+                    for dag_id, task_id, execution_date, try_number
+                    in tasks])
+            ti_query = ti_query.filter(or_(*filter_for_ti_state))
+        tis = ti_query.all()
+        r = []
+        if len(tis) > 0:
+            tasks_map = {}
+            for task in tasks:
+                key = (task[0], task[1], task[2])
+                i = tasks_map.get(key, [])
+                i.append(task[3])
+                tasks_map[key] = i
+            for ti in tis:
+                for try_number in tasks_map.get((ti.dag_id, ti.task_id, ti.execution_date)):
+                    r.append((ti.dag_id, ti.task_id, ti.execution_date, try_number))
+        return r

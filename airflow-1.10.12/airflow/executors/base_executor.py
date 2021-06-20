@@ -45,6 +45,7 @@ class BaseExecutor(LoggingMixin):
         self.queued_tasks = OrderedDict()
         self.running = {}
         self.event_buffer = {}
+        self.message_watermark = None
 
     def start(self):  # pragma: no cover
         """
@@ -109,10 +110,14 @@ class BaseExecutor(LoggingMixin):
         Executors should override this to perform gather statuses.
         """
 
+    def remove_running_task(self):
+        pass
+
     def heartbeat(self):
         # Triggering new jobs
         if not self.parallelism:
             open_slots = len(self.queued_tasks)
+            self.remove_running_task()
         else:
             open_slots = self.parallelism - len(self.running)
 

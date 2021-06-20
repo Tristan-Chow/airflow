@@ -43,6 +43,7 @@ from kombu.utils.uuid import uuid
 import socket
 from datetime import datetime
 
+
 log = logging.getLogger(__name__)
 
 # Make it constant for unit test.
@@ -172,6 +173,32 @@ class CeleryExecutor(BaseExecutor):
             'Starting Celery Executor using %s processes for syncing',
             self._sync_parallelism
         )
+        from airflow.cluster.message import Message
+        self.message_watermark = Message.look_for_max_id()
+
+    def remove_running_task(self):
+        from airflow.models import TaskInstance
+        from airflow.cluster.message import Message, TYPE_TASK_RUNNING, parse_task_running_content
+        if len(self.running) > 0:
+            self.message_watermark, messages = Message.find_messages(self.message_watermark,
+                                                                     [TYPE_TASK_RUNNING])
+            if len(messages) == 0:
+                return
+            keys = []
+            for message in messages:
+                keys.append(parse_task_running_content(message.content))
+            queued_keys = TaskInstance.find_queued_tis(keys)
+            for key in keys:
+                if key in queued_keys:
+                    continue
+                if key in self.tasks:
+                    self.running.pop(key, None)
+                    self.last_state.pop(key, None)
+                    self.tasks.pop(key, None)
+                    self.log.info(
+                        "Task %s.%s execution_date=%s try_number %s is running, give up to fetch state.",
+                        key[0], key[1], key[2], key[3]
+                    )
 
     def _num_tasks_per_send_process(self, to_send_count):
         """

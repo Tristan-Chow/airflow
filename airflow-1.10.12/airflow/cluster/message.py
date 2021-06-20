@@ -17,6 +17,7 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+import json
 from sqlalchemy import Column, Index, Integer, String, func, asc
 from airflow.utils.sqlalchemy import UtcDateTime
 from airflow.utils import timezone
@@ -25,6 +26,7 @@ from airflow.models import Base
 import sqlalchemy as sqla
 
 TYPE_DSYNCER = "dsyncer"
+TYPE_TASK_RUNNING = "task_running"
 
 
 class Message(Base):
@@ -68,3 +70,15 @@ class Message(Base):
     @provide_session
     def look_for_max_id(session=None):
         return session.query(sqla.func.max(Message.id)).first()[0]
+
+
+def make_task_running_content(dag_id, task_id, execution_date, try_number):
+    return json.dumps({'dag_id': dag_id,
+                       'task_id': task_id,
+                       'execution_date': execution_date.isoformat(),
+                       'try_number': try_number})
+
+
+def parse_task_running_content(content):
+    ti = json.loads(content)
+    return ti['dag_id'], ti['task_id'], timezone.parse(ti['execution_date']), ti['try_number']
