@@ -64,6 +64,7 @@ from airflow.utils.state import State
 from airflow import event_action
 from airflow.models.simpledag import SimpleDagModel
 from airflow.cluster.nodeinstance import NodeInstance, INSTANCE_SCHEDULER_LEADER, NODE_INSTANCE_DEAD
+from airflow.utils.trigger_rule import TriggerRule
 
 
 class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingStartMethodMixin):
@@ -871,20 +872,78 @@ class SchedulerJob(BaseJob):
         self.log.debug("Examining active DAG run: %s", run)
         tis = run.get_task_instances(state=SCHEDULEABLE_STATES)
 
+        task_to_downstream_ids = dict()
+        task_to_upstream_ids = dict()
+        for ti in tis:
+            ti.task = dag.get_task(ti.task_id)
+            upstream_list_set = set()
+            downstream_list_set = set()
+            for upstream_task_id in ti.task.upstream_task_ids:
+                if ti.task_id != upstream_task_id:
+                    upstream_list_set.add(upstream_task_id)
+            task_to_upstream_ids[ti.task_id] = (ti, upstream_list_set)
+            for downstream_task_id in ti.task.downstream_task_ids:
+                if ti.task_id != downstream_task_id and \
+                        dag.get_task(downstream_task_id).trigger_rule in {TriggerRule.ALL_SUCCESS,
+                                                                          TriggerRule.ALL_FAILED,
+                                                                          TriggerRule.ALL_DONE,
+                                                                          TriggerRule.NONE_FAILED,
+                                                                          TriggerRule.NONE_FAILED_OR_SKIPPED,
+                                                                          TriggerRule.NONE_SKIPPED}:
+                    downstream_list_set.add(downstream_task_id)
+            task_to_downstream_ids[ti.task_id] = downstream_list_set
+        all_scheduleable_task_ids = set(task_to_upstream_ids.keys())
+        # sort by dependencies
+        tis = []
+        while True:
+            task_ids = set(task_to_upstream_ids.keys())
+            if len(task_ids) == 0:
+                break
+            this_loop_add_task_ids = []
+            for this_task_id, ti_to_upstream_list in task_to_upstream_ids.items():
+                ti, upstream_list_set = ti_to_upstream_list
+                if len(task_ids & upstream_list_set) == 0:
+                    tis.append(ti)
+                    this_loop_add_task_ids.append(this_task_id)
+            for this_task_id in this_loop_add_task_ids:
+                del task_to_upstream_ids[this_task_id]
+
+        ignore_task_ids = set()
+
+        def add_task_ids_to_ignore(task_id):
+            if task_id not in task_to_downstream_ids:
+                return
+            downstream_ids = task_to_downstream_ids.pop(task_id)
+            for downstream_id in downstream_ids:
+                ignore_task_ids.add(downstream_id)
+                add_task_ids_to_ignore(downstream_id)
+
         # this loop is quite slow as it uses are_dependencies_met for
         # every task (in ti.is_runnable). This is also called in
         # update_state above which has already checked these tasks
         for ti in tis:
-            task = dag.get_task(ti.task_id)
-
-            # fixme: ti.task is transient but needs to be set
-            ti.task = task
-
+            if ti.task_id in ignore_task_ids:
+                continue
+            if ti.task.trigger_rule in {TriggerRule.ONE_FAILED, TriggerRule.ONE_SUCCESS} and \
+                    len(ti.task.upstream_task_ids) > 0 and \
+                    len(ti.task.upstream_task_ids) == len(set(ti.task.upstream_task_ids) & all_scheduleable_task_ids):
+                add_task_ids_to_ignore(ti.task_id)
+                continue
             if ti.are_dependencies_met(
                     dep_context=DepContext(flag_upstream_failed=True),
                     session=session):
                 self.log.debug('Queuing task: %s', ti)
                 task_instances_list.append(ti.key)
+
+            if ti.state in {State.NONE,
+                            State.SCHEDULED,
+                            State.QUEUED,
+                            State.RUNNING,
+                            State.UP_FOR_RETRY,
+                            State.UP_FOR_RESCHEDULE}:
+                add_task_ids_to_ignore(ti.task_id)
+            else:
+                all_scheduleable_task_ids.remove(ti.task_id)
 
     @provide_session
     def _change_state_for_tis_without_dagrun(self,
