@@ -422,7 +422,8 @@ class DbDagFileManager(BaseDagFileManager):
                 from airflow.jobs.base_job import BaseJob
                 self.base_job = BaseJob()
             if not settings.GLOBAL_SCHEDULE_MODE:
-                self.base_job.reset_state_for_orphaned_tasks(dag_ids=dag_ids)
+                self.base_job.reset_state_for_orphaned_tasks(dag_ids=dag_ids,
+                                                             reset_backfill=settings.SCHEDULE_BACKFILL_IN_SCHEDULER)
 
     @provide_session
     def print_path_info(self, fileloc, session=None):

@@ -187,6 +187,10 @@ def get_dags(args):
 
 @cli_utils.action_logging
 def backfill(args, dag=None):
+    if settings.SCHEDULE_BACKFILL_IN_SCHEDULER:
+        raise AirflowException("In schedule_backfill_in_scheduler mode,"
+                               "`airflow backfill` command is forbidden.")
+
     logging.basicConfig(
         level=settings.LOGGING_LEVEL,
         format=settings.SIMPLE_LOG_FORMAT)

@@ -319,6 +319,7 @@ class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingSt
 
 
 SCHEDULER_POOL = "scheduler_pool"
+SUB_DAG_POOL = "sub_dag_pool"
 
 
 class SchedulerJob(BaseJob):
@@ -421,9 +422,11 @@ class SchedulerJob(BaseJob):
         self.processor_agent = None
         self.is_leader = False
         self.node = None
-        self.ignore_pool = [SCHEDULER_POOL]
+        self.ignore_pool = [SCHEDULER_POOL, SUB_DAG_POOL]
         self.parallelism = self.executor.parallelism
         self.last_check_abnormal_state = timezone.datetime(2000, 1, 1)
+
+        self.parent_dag_contain_sub_dags_map = {}  # {dag_id: set([sub_dag_ids])}
 
         signal.signal(signal.SIGINT, self._exit_gracefully)
         signal.signal(signal.SIGTERM, self._exit_gracefully)
@@ -813,7 +816,7 @@ class SchedulerJob(BaseJob):
                 return next_run
 
     @provide_session
-    def _process_task_instances(self, dag, task_instances_list, session=None):
+    def _process_task_instances(self, dagbag, dag, task_instances_list, session=None):
         """
         This method schedules the tasks for a single DAG by looking at the
         active DAG runs and adding task instances that should run to the
@@ -839,7 +842,7 @@ class SchedulerJob(BaseJob):
                 break
 
             # skip backfill dagruns for now as long as they are not really scheduled
-            if run.is_backfill:
+            if not settings.SCHEDULE_BACKFILL_IN_SCHEDULER and run.is_backfill:
                 continue
 
             # todo: run.dag is transient but needs to be set
@@ -850,25 +853,38 @@ class SchedulerJob(BaseJob):
             if run.state == State.RUNNING:
                 make_transient(run)
                 active_dag_runs.append(run)
+                self._process_active_run(dag,
+                                         run,
+                                         task_instances_list,
+                                         session)
+                if settings.SCHEDULE_BACKFILL_IN_SCHEDULER:
+                    self._process_sub_dag_task_instances(dagbag,
+                                                         run,
+                                                         task_instances_list,
+                                                         session)
 
-        for run in active_dag_runs:
-            self.log.debug("Examining active DAG run: %s", run)
-            tis = run.get_task_instances(state=SCHEDULEABLE_STATES)
+    def _process_active_run(self,
+                            dag,
+                            run,
+                            task_instances_list,
+                            session=None):
+        self.log.debug("Examining active DAG run: %s", run)
+        tis = run.get_task_instances(state=SCHEDULEABLE_STATES)
 
-            # this loop is quite slow as it uses are_dependencies_met for
-            # every task (in ti.is_runnable). This is also called in
-            # update_state above which has already checked these tasks
-            for ti in tis:
-                task = dag.get_task(ti.task_id)
+        # this loop is quite slow as it uses are_dependencies_met for
+        # every task (in ti.is_runnable). This is also called in
+        # update_state above which has already checked these tasks
+        for ti in tis:
+            task = dag.get_task(ti.task_id)
 
-                # fixme: ti.task is transient but needs to be set
-                ti.task = task
+            # fixme: ti.task is transient but needs to be set
+            ti.task = task
 
-                if ti.are_dependencies_met(
-                        dep_context=DepContext(flag_upstream_failed=True),
-                        session=session):
-                    self.log.debug('Queuing task: %s', ti)
-                    task_instances_list.append(ti.key)
+            if ti.are_dependencies_met(
+                    dep_context=DepContext(flag_upstream_failed=True),
+                    session=session):
+                self.log.debug('Queuing task: %s', ti)
+                task_instances_list.append(ti.key)
 
     @provide_session
     def _change_state_for_tis_without_dagrun(self,
@@ -979,14 +995,17 @@ class SchedulerJob(BaseJob):
                 DR,
                 and_(DR.dag_id == TI.dag_id, DR.execution_date == TI.execution_date))
                 .filter(not_(TI.pool.in_(self.ignore_pool)))
-                .filter(or_(DR.run_id == None,  # noqa: E711 pylint: disable=singleton-comparison
-                            not_(DR.run_id.like(BackfillJob.ID_PREFIX + '%'))))
                 .filter(DR.state == State.RUNNING)
-                .outerjoin(DM, DM.dag_id == TI.dag_id)
-                .filter(or_(DM.dag_id == None,  # noqa: E711 pylint: disable=singleton-comparison
-                            not_(DM.is_paused)))
-                .group_by(TI.pool)
         )
+
+        if not settings.SCHEDULE_BACKFILL_IN_SCHEDULER:
+            ti_query = ti_query.filter(or_(DR.run_id == None,  # noqa: E711 pylint: disable=singleton-comparison
+                                       not_(DR.run_id.like(BackfillJob.ID_PREFIX + '%'))))
+
+        ti_query = (ti_query.outerjoin(DM, DM.dag_id == TI.dag_id)
+                            .filter(or_(DM.dag_id == None,  # noqa: E711 pylint: disable=singleton-comparison
+                                    not_(DM.is_paused)))
+                            .group_by(TI.pool))
 
         # Additional filters on task instance state
         if None in states:
@@ -1206,13 +1225,16 @@ class SchedulerJob(BaseJob):
                     DR,
                     and_(DR.dag_id == TI.dag_id, DR.execution_date == TI.execution_date)
                 )
-                .filter(or_(DR.run_id == None,  # noqa: E711 pylint: disable=singleton-comparison
-                            not_(DR.run_id.like(BackfillJob.ID_PREFIX + '%'))))
                 .filter(DR.state == State.RUNNING)
-                .outerjoin(DM, DM.dag_id == TI.dag_id)
-                .filter(or_(DM.dag_id == None,  # noqa: E711 pylint: disable=singleton-comparison
-                            not_(DM.is_paused)))
         )
+
+        if not settings.SCHEDULE_BACKFILL_IN_SCHEDULER:
+            ti_qry = ti_qry.filter(or_(DR.run_id == None,  # noqa: E711 pylint: disable=singleton-comparison
+                                       not_(DR.run_id.like(BackfillJob.ID_PREFIX + '%'))))
+
+        ti_qry = (ti_qry.outerjoin(DM, DM.dag_id == TI.dag_id)
+                        .filter(or_(DM.dag_id == None,  # noqa: E711 pylint: disable=singleton-comparison
+                                not_(DM.is_paused))))
 
         # Additional filters on task instance state
         if None in states:
@@ -1270,13 +1292,15 @@ class SchedulerJob(BaseJob):
                 DR,
                 and_(DR.dag_id == TI.dag_id, DR.execution_date == TI.execution_date)
             )
-            .filter(or_(DR.run_id == None,  # noqa: E711 pylint: disable=singleton-comparison
-                    not_(DR.run_id.like(BackfillJob.ID_PREFIX + '%'))))
-            .outerjoin(DM, DM.dag_id == TI.dag_id)
-            .filter(or_(DM.dag_id == None,  # noqa: E711 pylint: disable=singleton-comparison
-                    not_(DM.is_paused)))
         )
 
+        if not settings.SCHEDULE_BACKFILL_IN_SCHEDULER:
+            ti_query = ti_query.filter(or_(DR.run_id == None,  # noqa: E711 pylint: disable=singleton-comparison
+                                       not_(DR.run_id.like(BackfillJob.ID_PREFIX + '%'))))
+
+        ti_query = (ti_query.outerjoin(DM, DM.dag_id == TI.dag_id)
+                            .filter(or_(DM.dag_id == None,  # noqa: E711 pylint: disable=singleton-comparison
+                                    not_(DM.is_paused))))
         # Additional filters on task instance state
         if None in states:
             ti_query = ti_query.filter(
@@ -1644,6 +1668,9 @@ class SchedulerJob(BaseJob):
 
             self.log.info("Processing %s", dag.dag_id)
 
+            if settings.SCHEDULE_BACKFILL_IN_SCHEDULER:
+                self.delete_not_exists_sub_dag_records(dagbag, dag)
+
             dag_run = self.create_dag_run(dag)
             if dag_run:
                 expected_start_date = dag.following_schedule(dag_run.execution_date)
@@ -1653,7 +1680,7 @@ class SchedulerJob(BaseJob):
                         'dagrun.schedule_delay.{dag_id}'.format(dag_id=dag.dag_id),
                         schedule_delay)
                 self.log.info("Created %s", dag_run)
-            self._process_task_instances(dag, tis_out)
+            self._process_task_instances(dagbag, dag, tis_out)
             if conf.getboolean('core', 'CHECK_SLAS', fallback=True):
                 self.manage_slas(dag)
 
@@ -1800,7 +1827,7 @@ class SchedulerJob(BaseJob):
             session.merge(self.node)
             session.commit()
             self.is_leader = True
-            self.reset_state_for_orphaned_tasks(session=session)
+            self.reset_state_for_orphaned_tasks(session=session, reset_backfill=settings.SCHEDULE_BACKFILL_IN_SCHEDULER)
             self.executor = self.executor.__class__()
             self.executor.start()
             self.executor.parallelism = 0
@@ -1837,7 +1864,7 @@ class SchedulerJob(BaseJob):
 
         if not settings.SCHEDULER_CLUSTER:
             self.log.info("Resetting orphaned tasks for active dag runs")
-            self.reset_state_for_orphaned_tasks()
+            self.reset_state_for_orphaned_tasks(reset_backfill=settings.SCHEDULE_BACKFILL_IN_SCHEDULER)
 
         # Start after resetting orphaned tasks to avoid stressing out DB.
         self.processor_agent.start()
@@ -2147,9 +2174,15 @@ class SchedulerJob(BaseJob):
             SimpleDagModel.delete(paused_dag_ids)
 
         if len(self.dag_ids) > 0:
-            dags = [dag for dag in dagbag.dags.values()
-                    if dag.dag_id in self.dag_ids and
-                    dag.dag_id not in paused_dag_ids]
+            if settings.SCHEDULE_BACKFILL_IN_SCHEDULER:
+                dags = [dag for dag in dagbag.dags.values()
+                        if not dag.parent_dag and
+                        dag.dag_id in self.dag_ids and
+                        dag.dag_id not in paused_dag_ids]
+            else:
+                dags = [dag for dag in dagbag.dags.values()
+                        if dag.dag_id in self.dag_ids and
+                        dag.dag_id not in paused_dag_ids]
         else:
             dags = [dag for dag in dagbag.dags.values()
                     if not dag.parent_dag and
@@ -2164,6 +2197,8 @@ class SchedulerJob(BaseJob):
 
         run_tis = []
 
+        sub_dag_operators = []
+
         for ti_key in ti_keys_to_schedule:
             dag = dagbag.dags[ti_key[0]]
             task = dag.get_task(ti_key[1])
@@ -2171,6 +2206,10 @@ class SchedulerJob(BaseJob):
 
             if ti.task.__class__.__name__ in settings.OPERATOR_RUN_IN_SCHEDULER_SET and ti.task.run_in_scheduler:
                 run_tis.append(ti)
+                continue
+
+            if settings.SCHEDULE_BACKFILL_IN_SCHEDULER and ti.task.__class__.__name__ == 'SubDagOperator':
+                sub_dag_operators.append(ti)
                 continue
 
             ti.refresh_from_db(session=session, lock_for_update=True)
@@ -2215,6 +2254,15 @@ class SchedulerJob(BaseJob):
                                check_dependencies_met=True,
                                session=session)
 
+        for ti in sub_dag_operators:
+            dep_context = DepContext(deps=SCHEDULED_DEPS, ignore_task_deps=True)
+            self._run_internal(ti,
+                               lambda task_instance: task_instance.run_sub_dag_task(pool=SUB_DAG_POOL,
+                                                                                    dep_context=dep_context,
+                                                                                    session=session),
+                               check_dependencies_met=True,
+                               session=session)
+
         # Record import errors into the ORM
         try:
             self.update_import_errors(session, dagbag)
@@ -2236,3 +2284,107 @@ class SchedulerJob(BaseJob):
     @provide_session
     def heartbeat_callback(self, session=None):
         Stats.incr('scheduler_heartbeat', 1, 1)
+
+    @provide_session
+    def _process_sub_dag_task_instances(self,
+                                            dagbag,
+                                            run,
+                                            task_instances_list,
+                                            session=None):
+
+        sub_dags = self.parent_dag_contain_sub_dags_map.get(run.dag_id)
+        if not sub_dags:
+            return
+
+        sub_drs = session.query(models.DagRun) \
+            .filter(models.DagRun.dag_id.in_(sub_dags)) \
+            .filter(models.DagRun.state == State.RUNNING) \
+            .filter(models.DagRun.execution_date == run.execution_date)
+
+        for sub_dag_run in sub_drs:
+            sub_dag = dagbag.get_dag(sub_dag_run.dag_id)
+            sub_dag_run.dag = sub_dag
+            sub_dag_run.verify_integrity(session=session)
+            make_transient(sub_dag_run)
+            self._process_active_run(sub_dag,
+                                     sub_dag_run,
+                                     task_instances_list,
+                                     session)
+            sub_dag_run.update_state(session=session)
+            if sub_dag_run.state != State.RUNNING:
+                parent_dag_id = sub_dag_run.dag.parent_dag.dag_id
+                task_id_in_parent_dag = sub_dag_run.dag_id.split('.')[-1]
+                task = dagbag.get_dag(parent_dag_id).get_task(task_id_in_parent_dag)
+                ti = models.TaskInstance(task, sub_dag_run.execution_date)
+                self._run_internal(ti,
+                                   lambda task_instance: task_instance.handle_sub_dag_operator_task_instance_state(
+                                       sub_dag_run,
+                                       session=session),
+                                   check_dependencies_met=False,
+                                   session=session)
+
+    @provide_session
+    def delete_not_exists_sub_dag_records(self, dagbag, dag, session=None):
+        sub_dag_ids = session.query(models.DagModel.dag_id) \
+            .filter(models.DagModel.dag_id.like(dag.dag_id + ".%")) \
+            .all()
+        if len(sub_dag_ids) == 0:
+            return
+
+        sub_dag_ids = set([x[0] for x in sub_dag_ids])
+        dirty_ids = set()
+        for sub_dag_id in sub_dag_ids:
+            sub_dag = dagbag.get_dag(sub_dag_id)
+            if not sub_dag:
+                self.log.info("SubDag %s not found in dagbag.", sub_dag_id)
+                sub_dag_run_count = session.query(models.DagRun) \
+                    .filter(models.DagRun.dag_id == sub_dag_id) \
+                    .delete()
+                self.log.info("Delete %s dagRuns for %s.", sub_dag_run_count, sub_dag_id)
+                sub_dag_ti_count = session.query(models.TaskInstance) \
+                    .filter(models.TaskInstance.dag_id == sub_dag_id) \
+                    .delete()
+                self.log.info("Delete %s taskInstances for %s.", sub_dag_ti_count, sub_dag_id)
+                session.query(models.DagModel) \
+                    .filter(models.DagModel.dag_id == sub_dag_id) \
+                    .delete()
+                self.log.info("Delete dag records for %s.", sub_dag_id)
+                session.commit()
+                dirty_ids.add(sub_dag_id)
+
+        sub_dags = sub_dag_ids - dirty_ids
+
+        self.parent_dag_contain_sub_dags_map[dag.dag_id] = sub_dags
+
+        sub_tis = session \
+            .query(models.TaskInstance) \
+            .filter(or_(models.TaskInstance.dag_id.in_(sub_dags),
+                        models.TaskInstance.dag_id == dag.dag_id)) \
+            .filter(models.TaskInstance.state == State.RUNNING) \
+            .filter(models.TaskInstance.operator == "SubDagOperator") \
+            .all()
+
+        self.log.info("Running SubDagOperator taskInstance number is %s in %s", len(sub_tis), dag)
+        running_sub_tis = {ti.dag_id + "." + ti.task_id + ti.execution_date.isoformat(): ti for ti in sub_tis}
+
+        sub_drs = session \
+            .query(models.DagRun) \
+            .filter(models.DagRun.dag_id.in_(sub_dags)) \
+            .filter(models.DagRun.state == State.RUNNING) \
+            .all()
+        running_sub_drs = {dr.dag_id + dr.execution_date.isoformat(): dr for dr in sub_drs}
+        self.log.info("Running SubDag dagRun number is %s in %s", len(sub_drs), dag)
+        if len(running_sub_tis) > 0:
+            for key, ti in running_sub_tis.items():
+                if key not in running_sub_drs:
+                    self.log.warning("TaskInstance %s state is error, the dagRun is not running which refer to.", ti)
+                    ti.state = State.NONE
+                    session.merge(ti)
+                    session.commit()
+        if len(running_sub_drs) > 0:
+            for key, dr in running_sub_drs.items():
+                if key not in running_sub_tis:
+                    self.log.warning("SubDagRun %s state is error, the taskInstance is not running which refer to.", dr)
+                    dr.state = State.NONE
+                    session.merge(dr)
+                    session.commit()

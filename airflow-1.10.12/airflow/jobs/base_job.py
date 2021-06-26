@@ -237,7 +237,8 @@ class BaseJob(Base, LoggingMixin):
         raise NotImplementedError("This method needs to be overridden")
 
     @provide_session
-    def reset_state_for_orphaned_tasks(self, filter_by_dag_run=None, session=None, dag_ids=None):
+    def reset_state_for_orphaned_tasks(self, filter_by_dag_run=None, session=None, dag_ids=None,
+                                       reset_backfill=False):
         """
         This function checks if there are any tasks in the dagrun (or all)
         that have a scheduled state but are not known by the
@@ -246,6 +247,7 @@ class BaseJob(Base, LoggingMixin):
         The batch option is for performance reasons as the queries are made in
         sequence.
 
+        :param reset_backfill:
         :param filter_by_dag_run: the dag_run we want to process, None if all
         :type filter_by_dag_run: airflow.models.DagRun
         :return: the TIs reset (in expired SQLAlchemy state)
@@ -271,10 +273,12 @@ class BaseJob(Base, LoggingMixin):
             if dag_ids is not None:
                 query = query.filter(TI.dag_id.in_(dag_ids))
 
+            if not reset_backfill:
+                query = query.filter(DR.run_id.notlike(BackfillJob.ID_PREFIX + '%'))
+
             resettable_tis = (
                 query.filter(
                     DR.state == State.RUNNING,
-                    DR.run_id.notlike(BackfillJob.ID_PREFIX + '%'),
                     TI.state.in_(resettable_states))).all()
         else:
             resettable_tis = filter_by_dag_run.get_task_instances(state=resettable_states,

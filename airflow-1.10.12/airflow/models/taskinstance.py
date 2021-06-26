@@ -1246,6 +1246,104 @@ class TaskInstance(Base, LoggingMixin):
             self.log.exception(e)
 
     @provide_session
+    def run_sub_dag_task(self, pool, dep_context, job_id=0, session=None):
+        context = None
+        try:
+            task = self.task
+            self.refresh_from_db(session=session, lock_for_update=True)
+            if not self.are_dependencies_met(dep_context=dep_context,
+                                             session=session,
+                                             verbose=True):
+                session.commit()
+                return
+            self.pool = pool or task.pool
+            self.job_id = job_id
+            self.hostname = get_hostname()
+            self.operator = task.__class__.__name__
+            self.start_date = timezone.utcnow()
+
+            context = self.get_template_context()
+            self.state = State.RUNNING
+            self._try_number += 1
+            self.log.info("Starting attempt {} of {}".format(self.try_number, self.max_tries + 1))
+            task_copy = copy.copy(task)
+            self.task = task_copy
+
+            self.render_templates(context=context)
+            task_copy.pre_execute(context=context)
+
+            sub_dag = task_copy.subdag
+            execution_date = context['execution_date']
+            from airflow.jobs.backfill_job import BackfillJob
+            from airflow.models.dagrun import DagRun
+            run_id = BackfillJob.ID_FORMAT_PREFIX.format(execution_date.isoformat())
+            run = DagRun.find(dag_id=sub_dag.dag_id,
+                              execution_date=execution_date,
+                              session=session)
+            if run and len(run) > 0:
+                run = run[0]
+            else:
+                dr = self.get_dagrun()
+                run = sub_dag.create_dagrun(
+                    run_id=run_id,
+                    state=State.RUNNING,
+                    execution_date=execution_date,
+                    start_date=timezone.utcnow(),
+                    external_trigger=False,
+                    conf=dr.conf,
+                    session=session,
+                )
+
+            # set required transient field
+            run.dag = sub_dag
+
+            # explicitly mark as backfill and running
+            run.state = State.RUNNING
+            run.run_id = run_id
+            session.merge(self)
+            session.merge(run)
+            session.commit()
+            self.log.info("Create dag run for %s success.", run)
+        except (Exception, KeyboardInterrupt) as e:
+            self.handle_failure(error=e, context=context, session=session)
+
+    @provide_session
+    def handle_sub_dag_operator_task_instance_state(self, sub_dag_run, session=None):
+        if self.state != State.RUNNING:
+            self.log.warning(
+                'Try to update taskInstance state which refer to dag run %s, '
+                'but found its state is %s, skip.',
+                sub_dag_run, self.state)
+            return
+        context = self.get_template_context()
+        if sub_dag_run.state == State.FAILED:
+            self.handle_failure(error=AirflowException("SubDagRun failed."), context=context)
+        else:
+            self.state = State.SUCCESS
+
+            self.log.info("successful complete.")
+            try:
+                if self.task.on_success_callback:
+                    self.task.on_success_callback(context)
+            except Exception as e:
+                self.log.error("Failed when executing success callback")
+                self.log.exception(e)
+            # Recording SUCCESS
+            self.end_date = timezone.utcnow()
+            self.set_duration()
+
+            try:
+                event = event_action.TI_SUCCESS
+                event_action.do_ti_action(event, self.task, self, context)
+            except Exception as e:
+                self.log.error('Executing event action error for %s.%s.%s',
+                               self.dag_id, self.task_id, self.execution_date)
+                self.log.exception(e)
+
+        session.merge(self)
+        session.commit()
+
+    @provide_session
     def run(
             self,
             verbose=True,

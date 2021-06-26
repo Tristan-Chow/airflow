@@ -456,3 +456,5 @@ if 'SubDagOperator' in OPERATOR_RUN_IN_SCHEDULER_SET:
     OPERATOR_RUN_IN_SCHEDULER_SET.remove("SubDagOperator")
 
 GLOBAL_SCHEDULE_MODE = conf.getboolean("scheduler", "global_schedule_mode")
+
+SCHEDULE_BACKFILL_IN_SCHEDULER = conf.getboolean("core", "schedule_backfill_in_scheduler")
