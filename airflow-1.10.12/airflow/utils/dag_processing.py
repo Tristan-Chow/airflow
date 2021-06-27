@@ -48,7 +48,7 @@ import airflow.models
 from airflow.configuration import conf
 from airflow.dag.base_dag import BaseDag, BaseDagBag
 from airflow.exceptions import AirflowException
-from airflow.settings import Stats
+from airflow.settings import Stats, LAZY_SCHEDULE_MODE
 from airflow.models import errors
 from airflow.utils import timezone
 from airflow.utils.helpers import reap_process_group
@@ -57,6 +57,7 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.mixins import MultiprocessingStartMethodMixin
 from airflow.utils.state import State
 from airflow.cluster import get_dag_file_manager
+from airflow.cluster.message import Message, TYPE_FILE_PATH
 
 if six.PY2:
     ConnectionError = IOError
@@ -830,6 +831,8 @@ class DagFileProcessorManager(LoggingMixin):
         self._processor_timeout = processor_timeout
         self.dag_file_manager = None
         self.base_job = None
+        self.file_paths_next_schedule_date = {}
+        self.message_watermark = None
 
         self._log = logging.getLogger('airflow.processor_manager')
 
@@ -871,6 +874,8 @@ class DagFileProcessorManager(LoggingMixin):
 
         self.dag_file_manager = get_dag_file_manager(self.log)
         self.dag_file_manager.registry_scheduler()
+        if LAZY_SCHEDULE_MODE:
+            self.message_watermark = Message.look_for_max_id()
         while True:
 
             if self._signal_conn.poll(poll_time):
@@ -958,6 +963,18 @@ class DagFileProcessorManager(LoggingMixin):
         self._release_file_paths(to_release_file_paths)
         to_add_file_paths = self.dag_file_manager.add_files()
         self._add_file_paths(to_add_file_paths)
+        for file_path in self.get_file_paths_in_message():
+            if file_path in self._file_paths:
+                self.log.info("Receive priority path: %s", file_path)
+                if file_path not in self._file_path_queue:
+                    self.log.info("Reset %s schedule date.", file_path)
+                    self.file_paths_next_schedule_date[file_path] = timezone.utcnow()
+
+    def get_file_paths_in_message(self):
+        if not LAZY_SCHEDULE_MODE:
+            return []
+        self.message_watermark, messages = Message.find_messages(self.message_watermark, [TYPE_FILE_PATH])
+        return [message.content for message in messages]
 
     def _add_file_paths(self, file_paths):
         if file_paths is None or len(file_paths) == 0:
@@ -967,6 +984,7 @@ class DagFileProcessorManager(LoggingMixin):
             if file_path not in self._file_paths:
                 reset_state_file_paths.append(file_path)
                 self.file_paths.append(file_path)
+                self.file_paths_next_schedule_date[file_path] = timezone.utcnow()
         self.dag_file_manager.reset_state_for_orphaned_tasks(reset_state_file_paths)
 
     def _release_file_paths(self, file_paths):
@@ -981,6 +999,7 @@ class DagFileProcessorManager(LoggingMixin):
                 processor = self._processors.pop(file_path)
                 processor.terminate()
                 self._file_stats.pop(file_path)
+                self.file_paths_next_schedule_date.pop(file_path, None)
 
     def _print_stat(self):
         """
@@ -1227,6 +1246,13 @@ class DagFileProcessorManager(LoggingMixin):
                     self.get_run_count(file_path) + 1,
                 )
                 self._file_stats[file_path] = stat
+                old_next_scheduled_date = self.file_paths_next_schedule_date.pop(file_path, None)
+                new_next_scheduled_date = processor.result[4] if processor.result is not None else timezone.utcnow()
+                if old_next_scheduled_date is None:
+                    next_scheduled_date = new_next_scheduled_date
+                else:
+                    next_scheduled_date = min(new_next_scheduled_date, old_next_scheduled_date)
+                self.file_paths_next_schedule_date[file_path] = next_scheduled_date
             else:
                 running_processors[file_path] = processor
         self._processors = running_processors
@@ -1245,6 +1271,7 @@ class DagFileProcessorManager(LoggingMixin):
                     "Processor for %s exited with return code %s.",
                     processor.file_path, processor.exit_code
                 )
+                self.file_paths_next_schedule_date[processor.file_path] = timezone.utcnow()
             else:
                 for simple_dag in processor.result[0]:
                     simple_dags.append(simple_dag)
@@ -1267,6 +1294,7 @@ class DagFileProcessorManager(LoggingMixin):
                 processor.pid, file_path
             )
             self._processors[file_path] = processor
+            self.file_paths_next_schedule_date.pop(file_path, None)
 
     def prepare_file_path_queue(self):
         """
@@ -1278,11 +1306,8 @@ class DagFileProcessorManager(LoggingMixin):
         file_paths_in_progress = self._processors.keys()
         now = timezone.utcnow()
         file_paths_recently_processed = []
-        for file_path in self._file_paths:
-            last_finish_time = self.get_last_finish_time(file_path)
-            if (last_finish_time is not None and
-                (now - last_finish_time).total_seconds() <
-                    self._file_process_interval):
+        for file_path, next_schedule_date in self.file_paths_next_schedule_date.items():
+            if now < next_schedule_date:
                 file_paths_recently_processed.append(file_path)
 
         files_paths_at_run_limit = [file_path
@@ -1306,6 +1331,7 @@ class DagFileProcessorManager(LoggingMixin):
         )
 
         for file_path in files_paths_to_queue:
+            self.file_paths_next_schedule_date.pop(file_path, None)
             if file_path not in self._file_stats:
                 self._file_stats[file_path] = DagFileStat(0, 0, None, None, 0)
 
@@ -1369,6 +1395,7 @@ class DagFileProcessorManager(LoggingMixin):
                 # TODO: Remove ater Airflow 2.0
                 Stats.incr('dag_file_processor_timeouts')
                 processor.kill()
+                self.file_paths_next_schedule_date[file_path] = timezone.utcnow()
 
     def max_runs_reached(self):
         """

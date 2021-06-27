@@ -37,6 +37,7 @@ from airflow.cluster.message import Message, TYPE_DSYNCER
 from airflow.cluster.dag_file import DagFile, get_df_upsert_function
 from airflow.utils.dag_processing import check_file
 from airflow.utils import timezone
+from airflow.cluster.message import add_file_path as add_file_path_to_message
 
 
 depth = conf.getint("scheduler", "dag_dir_list_depth")
@@ -82,6 +83,7 @@ def update_dag_file_in_db(dags_folder, change_files, log=logging.getLogger(__nam
             continue
         log.info("Upsert %s.", file)
         df_upsert(file, timezone.utcnow(), session)
+        add_file_path_to_message(file, session)
 
 
 def update_dag_file_do_nothing(dags_folder, change_files, log=logging.getLogger(__name__)):

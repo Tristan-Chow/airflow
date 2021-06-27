@@ -90,6 +90,7 @@ from pygments.lexers.configs import IniLexer
 from sqlalchemy.orm import exc
 import six
 from six.moves.urllib_parse import urlunparse, urlsplit, urlunsplit
+from airflow.cluster.message import add_file_path as add_file_path_to_message
 
 api.load_auth()
 api_module = import_module(conf.get('cli', 'api_client'))  # type: Any
@@ -596,6 +597,12 @@ def run(args, dag=None):
                 root_logger.removeHandler(handler)
             for handler in root_logger_handlers:
                 root_logger.addHandler(handler)
+        if settings.LAZY_SCHEDULE_MODE:
+            try:
+                with db.create_session() as session:
+                    add_file_path_to_message(process_subdir(args.subdir), session)
+            except Exception:
+                traceback.print_exc()
     logging.shutdown()
 
 

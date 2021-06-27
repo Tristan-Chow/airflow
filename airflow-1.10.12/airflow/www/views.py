@@ -89,6 +89,7 @@ from airflow.www.forms import (DateTimeForm, DateTimeWithNumRunsForm,
                                DateTimeWithNumRunsWithDagRunsForm)
 from airflow.www.utils import wrapped_markdown
 from airflow.www.validators import GreaterEqualThan
+from airflow.cluster.message import add_file_path as add_file_path_to_message
 
 QUERY_LIMIT = 100000
 CHART_LIMIT = 200000
@@ -1240,6 +1241,7 @@ class Airflow(AirflowViewMixin, BaseView):
             ignore_task_deps=ignore_task_deps,
             ignore_ti_state=ignore_ti_state)
         executor.heartbeat()
+        add_file_path_to_message(dag)
         flash(
             "Sent {} to the message queue, "
             "it should start any moment now.".format(ti))
@@ -1325,6 +1327,8 @@ class Airflow(AirflowViewMixin, BaseView):
             external_trigger=True
         )
 
+        add_file_path_to_message(dag, session)
+
         flash(
             "Triggered {}, "
             "it should start any moment now.".format(dag_id))
@@ -1342,6 +1346,8 @@ class Airflow(AirflowViewMixin, BaseView):
                 include_parentdag=recursive,
                 only_failed=only_failed,
             )
+
+            add_file_path_to_message(dag)
 
             flash("{0} task instances have been cleared".format(count))
             return redirect(origin)
@@ -1560,6 +1566,7 @@ class Airflow(AirflowViewMixin, BaseView):
                                 upstream=upstream, downstream=downstream,
                                 future=future, past=past, state=state,
                                 commit=True)
+            add_file_path_to_message(dag)
 
             flash("Marked {} on {} task instances".format(state, len(altered)))
             return redirect(origin)
@@ -2114,9 +2121,11 @@ class Airflow(AirflowViewMixin, BaseView):
     def paused(self, session=None):
         dag_id = request.values.get('dag_id')
         is_paused = True if request.args.get('is_paused') == 'false' else False
-        models.DagModel.get_dagmodel(dag_id).set_is_paused(
+        dm = models.DagModel.get_dagmodel(dag_id)
+        dm.set_is_paused(
             is_paused=is_paused,
             store_serialized_dags=STORE_SERIALIZED_DAGS)
+        add_file_path_to_message(dm, session)
         return "OK"
 
     @expose('/refresh', methods=['POST'])
@@ -2963,6 +2972,11 @@ class DagRunModelView(ModelViewOnly):
         for row in deleted:
             dirty_ids.append(row.dag_id)
 
+        if len(dirty_ids) > 0:
+            DM = models.DagModel
+            filelocs = session.query(DM.fileloc).filter(DM.dag_id.in_(set(dirty_ids))).all()
+            add_file_path_to_message(set([fileloc[0] for fileloc in filelocs]), session)
+
     @action('set_running', "Set state to 'running'", None)
     @provide_session
     def action_set_running(self, ids, session=None):
@@ -2975,6 +2989,12 @@ class DagRunModelView(ModelViewOnly):
                 count += 1
                 dr.state = State.RUNNING
                 dr.start_date = timezone.utcnow()
+
+            if len(dirty_ids) > 0:
+                DM = models.DagModel
+                filelocs = session.query(DM.fileloc).filter(DM.dag_id.in_(set(dirty_ids))).all()
+                add_file_path_to_message(set([fileloc[0] for fileloc in filelocs]), session)
+
             flash(
                 "{count} dag runs were set to running".format(**locals()))
         except Exception as ex:
@@ -3002,6 +3022,12 @@ class DagRunModelView(ModelViewOnly):
                                                 commit=True,
                                                 session=session)
             altered_ti_count = len(altered_tis)
+
+            if len(dirty_ids) > 0:
+                DM = models.DagModel
+                filelocs = session.query(DM.fileloc).filter(DM.dag_id.in_(set(dirty_ids))).all()
+                add_file_path_to_message(set([fileloc[0] for fileloc in filelocs]), session)
+
             flash(
                 "{count} dag runs and {altered_ti_count} task instances "
                 "were set to failed".format(**locals()))
@@ -3030,6 +3056,12 @@ class DagRunModelView(ModelViewOnly):
                                                  commit=True,
                                                  session=session)
             altered_ti_count = len(altered_tis)
+
+            if len(dirty_ids) > 0:
+                DM = models.DagModel
+                filelocs = session.query(DM.fileloc).filter(DM.dag_id.in_(set(dirty_ids))).all()
+                add_file_path_to_message(set([fileloc[0] for fileloc in filelocs]), session)
+
             flash(
                 "{count} dag runs and {altered_ti_count} task instances "
                 "were set to success".format(**locals()))
@@ -3043,24 +3075,27 @@ class DagRunModelView(ModelViewOnly):
     def after_model_change(self, form, dagrun, is_created, session=None):
         dagbag = get_dag_bag(dagrun.dag_id)
         altered_tis = []
+        dag = dagbag.get_dag(dagrun.dag_id)
         if dagrun.state == State.SUCCESS:
             altered_tis = set_dag_run_state_to_success(
-                dagbag.get_dag(dagrun.dag_id),
+                dag,
                 dagrun.execution_date,
                 commit=True,
                 session=session)
         elif dagrun.state == State.FAILED:
             altered_tis = set_dag_run_state_to_failed(
-                dagbag.get_dag(dagrun.dag_id),
+                dag,
                 dagrun.execution_date,
                 commit=True,
                 session=session)
         elif dagrun.state == State.RUNNING:
             altered_tis = set_dag_run_state_to_running(
-                dagbag.get_dag(dagrun.dag_id),
+                dag,
                 dagrun.execution_date,
                 commit=True,
                 session=session)
+
+        add_file_path_to_message(dag, session)
 
         altered_ti_count = len(altered_tis)
         flash(
@@ -3169,6 +3204,7 @@ class TaskInstanceModelView(ModelViewOnly):
                 models.clear_task_instances(tis, session=session, dag=dag)
 
             session.commit()
+            add_file_path_to_message(list(dag_to_tis.keys()), session)
 
             flash("{0} task instances have been cleared".format(len(ids)))
 
@@ -3182,6 +3218,7 @@ class TaskInstanceModelView(ModelViewOnly):
         try:
             TI = models.TaskInstance
             count = len(ids)
+            dag_ids = set()
             for id in ids:
                 task_id, dag_id, execution_date = iterdecode(id)
                 execution_date = parse_execution_date(execution_date)
@@ -3192,7 +3229,14 @@ class TaskInstanceModelView(ModelViewOnly):
                 if ti.state == State.UP_FOR_RESCHEDULE:
                     ti.try_number = ti.next_try_number
                 ti.state = target_state
+                dag_ids.add(dag_id)
             session.commit()
+
+            if len(dag_ids) > 0:
+                DM = models.DagModel
+                filelocs = session.query(DM.fileloc).filter(DM.dag_id.in_(dag_ids)).all()
+                add_file_path_to_message(set([fileloc[0] for fileloc in filelocs]), session)
+
             flash(
                 "{count} task instances were set to '{target_state}'".format(**locals()))
         except Exception as ex:

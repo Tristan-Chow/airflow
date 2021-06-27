@@ -24,9 +24,11 @@ from airflow.utils import timezone
 from airflow.utils.db import provide_session
 from airflow.models import Base
 import sqlalchemy as sqla
+from airflow import settings
 
 TYPE_DSYNCER = "dsyncer"
 TYPE_TASK_RUNNING = "task_running"
+TYPE_FILE_PATH = 'file_path'
 
 
 class Message(Base):
@@ -82,3 +84,37 @@ def make_task_running_content(dag_id, task_id, execution_date, try_number):
 def parse_task_running_content(content):
     ti = json.loads(content)
     return ti['dag_id'], ti['task_id'], timezone.parse(ti['execution_date']), ti['try_number']
+
+
+def parse_file_path(content):
+    from airflow.models import DAG, DagModel
+    file_path = None
+    if isinstance(content, str):
+        file_path = content
+    elif isinstance(content, DagModel):
+        file_path = content.fileloc
+    elif isinstance(content, DAG):
+        while True:
+            if content.parent_dag:
+                content = content.parent_dag
+                continue
+            file_path = content.fileloc
+            break
+    return file_path
+
+
+@provide_session
+def add_file_path(contents, session=None):
+    if not settings.LAZY_SCHEDULE_MODE:
+        return
+    file_paths = set()
+    if isinstance(contents, list) or isinstance(contents, set):
+        for content in contents:
+            file_path = parse_file_path(content)
+            if file_path is not None:
+                file_paths.add(file_path)
+    else:
+        file_path = parse_file_path(contents)
+        if file_path is not None:
+            file_paths.add(file_path)
+    Message.add(TYPE_FILE_PATH, file_paths, session)

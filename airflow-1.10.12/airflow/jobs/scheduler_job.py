@@ -65,6 +65,8 @@ from airflow import event_action
 from airflow.models.simpledag import SimpleDagModel
 from airflow.cluster.nodeinstance import NodeInstance, INSTANCE_SCHEDULER_LEADER, NODE_INSTANCE_DEAD
 from airflow.utils.trigger_rule import TriggerRule
+from airflow.models import TaskReschedule
+from airflow.cluster.message import add_file_path as add_file_path_to_message
 
 
 class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingStartMethodMixin):
@@ -165,7 +167,8 @@ class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingSt
             result_channel.send(result)
             end_time = time.time()
             log.info(
-                "Processing %s took %.3f seconds", file_path, end_time - start_time
+                "Processing %s took %.3f seconds, next schedule date: %s",
+                file_path, end_time - start_time, result[4]
             )
         except Exception:
             # Log exceptions through the logging framework.
@@ -429,6 +432,11 @@ class SchedulerJob(BaseJob):
 
         self.parent_dag_contain_sub_dags_map = {}  # {dag_id: set([sub_dag_ids])}
 
+        self.max_file_process_interval = conf.getint('scheduler', 'max_file_process_interval')
+        self.min_file_process_interval = conf.getint('scheduler', 'min_file_process_interval')
+        self.next_schedule_interval = self.max_file_process_interval
+        self.max_file_process_interval_in_running = conf.getint('scheduler', 'max_file_process_interval_in_running')
+
         signal.signal(signal.SIGINT, self._exit_gracefully)
         signal.signal(signal.SIGTERM, self._exit_gracefully)
 
@@ -638,6 +646,7 @@ class SchedulerJob(BaseJob):
         mt = latest_dr.execution_date + dag.notify_sla
         now = timezone.utcnow()
         if now < mt:
+            self.set_next_schedule_interval((mt - now).total_seconds())
             return
 
         DS = models.DagSlaMiss
@@ -784,6 +793,8 @@ class SchedulerJob(BaseJob):
 
             # don't ever schedule in the future or if next_run_date is None
             if not next_run_date or next_run_date > timezone.utcnow():
+                if next_run_date is not None:
+                    self.set_next_schedule_interval((next_run_date - timezone.utcnow()).total_seconds())
                 return
 
             # this structure is necessary to avoid a TypeError from concatenating
@@ -814,6 +825,7 @@ class SchedulerJob(BaseJob):
                     state=State.RUNNING,
                     external_trigger=False
                 )
+                self.set_next_schedule_interval(self.min_file_process_interval)
                 return next_run
 
     @provide_session
@@ -832,6 +844,7 @@ class SchedulerJob(BaseJob):
             # don't consider runs that are executed in the future unless
             # specified by config and schedule_interval is None
             if run.execution_date > timezone.utcnow() and not dag.allow_future_exec_dates:
+                self.set_next_schedule_interval((run.execution_date - timezone.utcnow()).total_seconds())
                 self.log.error(
                     "Execution date is in future: %s",
                     run.execution_date
@@ -850,19 +863,28 @@ class SchedulerJob(BaseJob):
             run.dag = dag
             # todo: preferably the integrity check happens at dag collection time
             run.verify_integrity(session=session)
+            make_transient(run)
+            self.set_next_schedule_interval(self.max_file_process_interval_in_running)
+            self._process_active_run(dag,
+                                     run,
+                                     task_instances_list,
+                                     session)
             run.update_state(session=session)
             if run.state == State.RUNNING:
-                make_transient(run)
                 active_dag_runs.append(run)
-                self._process_active_run(dag,
-                                         run,
-                                         task_instances_list,
-                                         session)
                 if settings.SCHEDULE_BACKFILL_IN_SCHEDULER:
                     self._process_sub_dag_task_instances(dagbag,
                                                          run,
                                                          task_instances_list,
                                                          session)
+            else:
+                self.set_next_schedule_interval(self.min_file_process_interval)
+
+    @property
+    def is_min_next_scheduler_interval(self):
+        if not settings.LAZY_SCHEDULE_MODE:
+            return True
+        return self.next_schedule_interval <= self.min_file_process_interval
 
     def _process_active_run(self,
                             dag,
@@ -934,6 +956,7 @@ class SchedulerJob(BaseJob):
                     session=session):
                 self.log.debug('Queuing task: %s', ti)
                 task_instances_list.append(ti.key)
+                self.set_next_schedule_interval(self.min_file_process_interval)
 
             if ti.state in {State.NONE,
                             State.SCHEDULED,
@@ -944,6 +967,35 @@ class SchedulerJob(BaseJob):
                 add_task_ids_to_ignore(ti.task_id)
             else:
                 all_scheduleable_task_ids.remove(ti.task_id)
+
+        if not self.is_min_next_scheduler_interval:
+            count = (session.query(func.count('*')).filter(models.TaskInstance.dag_id == run.dag_id,
+                                                           models.TaskInstance.execution_date == run.execution_date)
+                                                   .filter(models.TaskInstance.state.in_((State.QUEUED,
+                                                                                          State.SCHEDULED)))).first()[0]
+            if count > 0:
+                self.set_next_schedule_interval(self.min_file_process_interval)
+                return
+            reschedule_tis = []
+            for ti in tis:
+                if ti.state == State.UP_FOR_RETRY:
+                    next_retry_datetime = ti.next_retry_datetime()
+                    self.set_next_schedule_interval((next_retry_datetime - timezone.utcnow()).total_seconds())
+                    continue
+
+                if ti.state == State.UP_FOR_RESCHEDULE:
+                    reschedule_tis.append(ti)
+
+            if len(reschedule_tis) > 0:
+                next_reschedule_dates = []
+                now = timezone.utcnow()
+                for ti in reschedule_tis:
+                    task_reschedules = TaskReschedule.find_for_task_instance(task_instance=ti)
+                    if not task_reschedules:
+                        continue
+                    next_reschedule_dates.append((task_reschedules[-1].reschedule_date - now).total_seconds())
+                if len(next_reschedule_dates) > 0:
+                    self.set_next_schedule_interval(max(next_reschedule_dates))
 
     @provide_session
     def _change_state_for_tis_without_dagrun(self,
@@ -1793,6 +1845,7 @@ class SchedulerJob(BaseJob):
                         dag = dagbag.get_dag(dag_id)
                         ti.task = dag.get_task(task_id)
                         ti.handle_failure(msg)
+                        add_file_path_to_message(simple_dag.full_filepath, session)
                     except Exception:
                         self.log.error("Cannot load the dag bag to handle failure for %s"
                                        ". Setting task to FAILED without callbacks or "
@@ -2162,6 +2215,18 @@ class SchedulerJob(BaseJob):
             for handler in root_logger_handlers:
                 root_logger.addHandler(handler)
 
+    def set_next_schedule_interval(self, interval):
+        self.next_schedule_interval = min(self.next_schedule_interval, interval)
+
+    @property
+    def next_schedule_date(self):
+        self.log.info("Next schedule interval: %s seconds.", self.next_schedule_interval)
+        if settings.LAZY_SCHEDULE_MODE:
+            return timezone.utcnow() + \
+                   timedelta(seconds=max(self.next_schedule_interval, self.min_file_process_interval))
+        else:
+            return timezone.utcnow() + timedelta(seconds=self.min_file_process_interval)
+
     @provide_session
     def process_file(self, file_path, zombies, pickle_dags=False, session=None):
         """
@@ -2199,14 +2264,16 @@ class SchedulerJob(BaseJob):
         except Exception:
             self.log.exception("Failed at reloading the DAG file %s", file_path)
             Stats.incr('dag_file_refresh_error', 1, 1)
-            return simple_dags, found_dag_count, 0
+            return simple_dags, found_dag_count, 0, file_path, self.next_schedule_date
 
         if len(dagbag.dags) > 0:
             self.log.info("DAG(s) %s retrieved from %s", dagbag.dags.keys(), file_path)
         else:
             self.log.warning("No viable dags retrieved from %s", file_path)
             self.update_import_errors(session, dagbag)
-            return simple_dags, found_dag_count, len(dagbag.import_errors)
+            if not os.path.exists(file_path):
+                self.set_next_schedule_interval(self.min_file_process_interval)
+            return simple_dags, found_dag_count, len(dagbag.import_errors), file_path, self.next_schedule_date
 
         # Save individual DAGs in the ORM and update DagModel.last_scheduled_time
         for dag in dagbag.dags.values():
@@ -2338,7 +2405,7 @@ class SchedulerJob(BaseJob):
             except Exception:
                 self.log.exception("Error manage dag notify_slas for %s!", dag.dag_id)
 
-        return simple_dags, found_dag_count, len(dagbag.import_errors)
+        return simple_dags, found_dag_count, len(dagbag.import_errors), file_path, self.next_schedule_date
 
     @provide_session
     def heartbeat_callback(self, session=None):
@@ -2371,6 +2438,7 @@ class SchedulerJob(BaseJob):
                                      session)
             sub_dag_run.update_state(session=session)
             if sub_dag_run.state != State.RUNNING:
+                self.set_next_schedule_interval(self.min_file_process_interval)
                 parent_dag_id = sub_dag_run.dag.parent_dag.dag_id
                 task_id_in_parent_dag = sub_dag_run.dag_id.split('.')[-1]
                 task = dagbag.get_dag(parent_dag_id).get_task(task_id_in_parent_dag)
@@ -2440,6 +2508,7 @@ class SchedulerJob(BaseJob):
                     ti.state = State.NONE
                     session.merge(ti)
                     session.commit()
+                    self.set_next_schedule_interval(self.min_file_process_interval)
         if len(running_sub_drs) > 0:
             for key, dr in running_sub_drs.items():
                 if key not in running_sub_tis:
@@ -2447,3 +2516,4 @@ class SchedulerJob(BaseJob):
                     dr.state = State.NONE
                     session.merge(dr)
                     session.commit()
+                    self.set_next_schedule_interval(self.min_file_process_interval)

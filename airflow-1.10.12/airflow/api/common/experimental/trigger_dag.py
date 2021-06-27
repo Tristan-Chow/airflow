@@ -25,6 +25,7 @@ from airflow.exceptions import DagRunAlreadyExists, DagNotFound
 from airflow.models import DagRun, DagBag, DagModel
 from airflow.utils import timezone
 from airflow.utils.state import State
+from airflow.cluster.message import add_file_path as add_file_path_to_message
 
 
 def _trigger_dag(
@@ -136,5 +137,7 @@ def trigger_dag(
         execution_date=execution_date,
         replace_microseconds=replace_microseconds,
     )
+
+    add_file_path_to_message(dag_model.fileloc)
 
     return triggers[0] if triggers else None
