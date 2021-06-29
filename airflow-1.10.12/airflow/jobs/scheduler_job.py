@@ -69,6 +69,264 @@ from airflow.models import TaskReschedule
 from airflow.cluster.message import add_file_path as add_file_path_to_message
 
 
+class ResidentDagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingStartMethodMixin):
+    HEARTBEAT_SIGNAL = 1
+    class_creation_counter = 0
+
+    def __init__(self, file_paths_queue, pickle_dags, dag_ids, zombies):
+        self._file_paths_queue = file_paths_queue
+        # The process that was launched to process the given .
+        self._process = None
+        self._dag_ids = dag_ids
+        self._pickle_dags = pickle_dags
+        # The result of Scheduler.process_file(file_path).
+        self._result = None
+        # Whether the process is done running.
+        self._done = False
+        # When the process started.
+        self._start_time = None
+        self._zombies = zombies
+
+        self._heartbeat = None
+        # This ID is use to uniquely name the process / thread that's launched
+        # by this processor instance
+        self._parent_channel = None
+        self._child_channel = None
+        self._instance_id = ResidentDagFileProcessor.class_creation_counter
+        ResidentDagFileProcessor.class_creation_counter += 1
+        self.process_name = "DagFileProcessor-{}".format(self._instance_id)
+
+    @property
+    def file_path(self):
+        return None
+
+    @staticmethod
+    def _run_file_processor(result_channel,
+                            file_paths_queue,
+                            pickle_dags,
+                            dag_ids,
+                            thread_name,
+                            zombies):
+        settings.configure_orm()
+
+        def signal_handler(signum, frame):
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        try:
+            while True:
+                start_time = time.time()
+                file_path = file_paths_queue.get_node(thread_name)
+                if file_path is None:
+                    result_channel.send(ResidentDagFileProcessor.HEARTBEAT_SIGNAL)
+                    setproctitle("airflow scheduler - {} {}".format(thread_name, "waiting"))
+                    time.sleep(1)
+                    continue
+
+                log = logging.getLogger("airflow.processor")
+                stdout = StreamLogWriter(log, logging.INFO)
+                stderr = StreamLogWriter(log, logging.WARN)
+
+                set_context(log, file_path)
+                setproctitle("airflow scheduler - {} {}".format(thread_name, file_path))
+
+                try:
+                    # redirect stdout/stderr to log
+                    sys.stdout = stdout
+                    sys.stderr = stderr
+
+                    # Change the thread name to differentiate log lines. This is
+                    # really a separate process, but changing the name of the
+                    # process doesn't work, so changing the thread name instead.
+                    threading.current_thread().name = thread_name
+                    log.info("Started process (PID=%s) to work on %s",
+                             os.getpid(), file_path)
+                    scheduler_job = SchedulerJob(dag_ids=dag_ids, log=log,  registry_exit=False)
+                    simple_dags, found_dag_count, import_errors, file_path, next_schedule_date = \
+                        scheduler_job.process_file(file_path,
+                                                   zombies,
+                                                   pickle_dags)
+
+                    result_channel.send((simple_dags, found_dag_count, import_errors, file_path, next_schedule_date))
+
+                    duration = time.time() - start_time
+
+                    log.info(
+                        "Processing %s took %.3f seconds. Next schedule date %s",
+                        file_path,
+                        duration,
+                        next_schedule_date
+                    )
+
+                except Exception as e:
+                    # Log exceptions through the logging framework.
+                    print(e)
+                    log.exception("Got an exception! Propagating...")
+                finally:
+                    file_paths_queue.finished(thread_name)
+                    sys.stdout = sys.__stdout__
+                    sys.stderr = sys.__stderr__
+        finally:
+            settings.dispose_orm()
+            result_channel.close()
+
+    def start(self):
+        """
+        Launch the process and start processing the DAG.
+        """
+
+        if six.PY2:
+            context = multiprocessing
+        else:
+            start_method = self._get_multiprocessing_start_method()
+            context = multiprocessing.get_context(start_method)
+
+        self._parent_channel, self._child_channel = context.Pipe()
+
+        self._process = multiprocessing.Process(
+            target=type(self)._run_file_processor,
+            args=(
+                self._child_channel,
+                self._file_paths_queue,
+                self._pickle_dags,
+                self._dag_ids,
+                self.process_name,
+                self._zombies,
+            ),
+            name="DagFileProcessor-{}-Process".format(self._instance_id)
+        )
+        self._start_time = timezone.utcnow()
+        self._heartbeat = timezone.utcnow()
+        self._process.start()
+
+    def kill(self):
+        """
+        Kill the process launched to process the file, and ensure consistent state.
+        """
+        if self._process is None:
+            raise AirflowException("Tried to kill before starting!")
+        # The queue will likely get corrupted, so remove the reference
+        self._kill_process()
+
+    def terminate(self, sigkill=True, havest_dags=False):
+        """
+        Terminate (and then kill) the process launched to process the file.
+
+        :param sigkill: whether to issue a SIGKILL if SIGTERM doesn't work.
+        :type sigkill: bool
+        """
+        if self._process is None:
+            raise AirflowException("Tried to call terminate before starting!")
+
+        self._process.terminate()
+
+        if six.PY2:
+            self._process.join(2)
+        else:
+            from contextlib import suppress
+            with suppress(TimeoutError):
+                self._process._popen.wait(2)  # pylint: disable=protected-access
+        if sigkill:
+            self._kill_process()
+        if havest_dags:
+            self.havest_dags()
+        if self._parent_channel is not None:
+            self._parent_channel.close()
+            self._parent_channel = None
+
+    @property
+    def pid(self):
+        """
+        :return: the PID of the process launched to process the given file
+        :rtype: int
+        """
+        if self._process is None:
+            raise AirflowException("Tried to get PID before starting!")
+        return self._process.pid
+
+    @property
+    def exit_code(self):
+        """
+        After the process is finished, this can be called to get the return code
+
+        :return: the exit code of the process
+        :rtype: int
+        """
+        if not self._done:
+            raise AirflowException("Tried to call retcode before process was finished!")
+        return self._process.exitcode
+
+    @property
+    def done(self):
+        """
+        Check if the process launched to process this file is done.
+        :return: whether the process is finished running
+        :rtype: bool
+        """
+        return self._done
+
+    @property
+    def alive(self):
+        """
+        Check if the process launched to process this file is done.
+        :return: whether the process is finished running
+        :rtype: bool
+        """
+        return self.alive
+
+    def havest_dags(self):
+        """
+        :return: result of running SchedulerJob.process_file()
+        :rtype: list[airflow.utils.dag_processing.SimpleDag]
+
+        {file_path:{finished_time:[simple_dags]}}
+        """
+        self._result = []
+        while self._parent_channel.poll():
+            res = self._parent_channel.recv()
+            self._heartbeat = timezone.utcnow()
+            if res == ResidentDagFileProcessor.HEARTBEAT_SIGNAL:
+                continue
+            self._result.append(res)
+        return self._result
+
+    @property
+    def result(self):
+        """
+        Check if the process launched to process this file is done.
+        :return: whether the process is finished running
+        :rtype: bool
+        """
+        return self._result
+
+    @property
+    def start_time(self):
+        """
+        :return: when this started to process the file
+        :rtype: datetime
+        """
+        if self._start_time is None:
+            raise AirflowException("Tried to get start time before it started!")
+        return self._start_time
+
+    @property
+    def heartbeat(self):
+        """
+        :return: when this started to process the file
+        :rtype: datetime
+        """
+        if self._heartbeat is None:
+            raise AirflowException("Tried to get heartbeat before it started!")
+        return self._heartbeat
+
+    def _kill_process(self):
+        if self._process.is_alive():
+            self.log.warning("Killing PID %s", self._process.pid)
+            os.kill(self._process.pid, signal.SIGKILL)
+
+
 class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingStartMethodMixin):
     """Helps call SchedulerJob.process_file() in a separate process.
 
@@ -369,6 +627,7 @@ class SchedulerJob(BaseJob):
             run_duration=None,
             do_pickle=False,
             log=None,
+            registry_exit=True,
             *args, **kwargs):
         """
         :param dag_id: if specified, only schedule tasks with this DAG ID
@@ -437,8 +696,9 @@ class SchedulerJob(BaseJob):
         self.next_schedule_interval = self.max_file_process_interval
         self.max_file_process_interval_in_running = conf.getint('scheduler', 'max_file_process_interval_in_running')
 
-        signal.signal(signal.SIGINT, self._exit_gracefully)
-        signal.signal(signal.SIGTERM, self._exit_gracefully)
+        if registry_exit:
+            signal.signal(signal.SIGINT, self._exit_gracefully)
+            signal.signal(signal.SIGTERM, self._exit_gracefully)
 
     def _exit_gracefully(self, signum, frame):
         """
@@ -1898,14 +2158,15 @@ class SchedulerJob(BaseJob):
             self.log.info("Exited execute loop")
 
     @staticmethod
-    def _create_dag_file_processor(file_path, zombies, dag_ids, pickle_dags):
+    def _create_dag_file_processor(file_path_or_queue, zombies, dag_ids, pickle_dags):
         """
         Creates DagFileProcessorProcess instance.
         """
-        return DagFileProcessor(file_path,
-                                pickle_dags,
-                                dag_ids,
-                                zombies)
+        processor = DagFileProcessor if not settings.DAG_PROCESSOR_RESIDENT else ResidentDagFileProcessor
+        return processor(file_path_or_queue,
+                         pickle_dags,
+                         dag_ids,
+                         zombies)
 
     def _get_simple_dags(self):
         return self.processor_agent.harvest_simple_dags()

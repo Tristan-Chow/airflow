@@ -48,7 +48,7 @@ import airflow.models
 from airflow.configuration import conf
 from airflow.dag.base_dag import BaseDag, BaseDagBag
 from airflow.exceptions import AirflowException
-from airflow.settings import Stats, LAZY_SCHEDULE_MODE
+from airflow.settings import Stats, LAZY_SCHEDULE_MODE, DAG_PROCESSOR_RESIDENT
 from airflow.models import errors
 from airflow.utils import timezone
 from airflow.utils.helpers import reap_process_group
@@ -58,11 +58,89 @@ from airflow.utils.mixins import MultiprocessingStartMethodMixin
 from airflow.utils.state import State
 from airflow.cluster import get_dag_file_manager
 from airflow.cluster.message import Message, TYPE_FILE_PATH
+from multiprocessing.managers import BaseManager
 
 if six.PY2:
     ConnectionError = IOError
 
 log = logging.getLogger(__name__)
+
+
+class FilePathsQueue:
+
+    def __init__(self):
+        self.start_key = "#START#"
+        self.end_key = "#END#"
+        self.nodes_asc = {self.start_key: self.end_key}
+        self.nodes_desc = {self.end_key: self.start_key}
+        self.process_to_file_paths = {}
+
+    def lpush(self, node):
+        if node in self.nodes_asc:
+            return
+        next_key = self.nodes_asc[self.start_key]
+        self.nodes_asc[self.start_key] = node
+        self.nodes_asc[node] = next_key
+        self.nodes_desc[node] = self.start_key
+        self.nodes_desc[next_key] = node
+
+    def rpush(self, node):
+        if node in self.nodes_asc:
+            return
+        last_key = self.nodes_desc[self.end_key]
+        self.nodes_desc[self.end_key] = node
+        self.nodes_desc[node] = last_key
+        self.nodes_asc[node] = self.end_key
+        self.nodes_asc[last_key] = node
+
+    def lpop(self):
+        if len(self.nodes_asc) <= 1:
+            return None
+        node = self.nodes_asc[self.start_key]
+        next_key = self.nodes_asc.pop(node)
+        self.nodes_asc[self.start_key] = next_key
+        self.nodes_desc[next_key] = self.nodes_desc.pop(node)
+        return node
+
+    def rpop(self):
+        if len(self.nodes_desc) <= 1:
+            return None
+        node = self.nodes_desc[self.end_key]
+        last_key = self.nodes_desc.pop(node)
+        self.nodes_desc[self.end_key] = last_key
+        self.nodes_asc[last_key] = self.nodes_asc.pop(node)
+        return node
+
+    def size(self):
+        return len(self.nodes_asc) - 1
+
+    def get_node(self, name):
+        file_path = self.rpop()
+        if file_path is None:
+            return None
+        self.process_to_file_paths[name] = file_path
+        return file_path
+
+    def finished(self, name):
+        file_path = self.process_to_file_paths.pop(name, None)
+        return file_path
+
+    def remove(self, node):
+        if node in self.nodes_asc:
+            next_key = self.nodes_asc.pop(node)
+            last_key = self.nodes_desc.pop(node)
+            self.nodes_asc[last_key] = next_key
+            self.nodes_desc[next_key] = last_key
+
+    def add_priority_path(self, file_path):
+        if file_path in self.process_to_file_paths.values():
+            return False
+        self.remove(file_path)
+        self.rpush(file_path)
+        return True
+
+    def in_(self, file_path):
+        return file_path in self.nodes_asc or file_path in self.process_to_file_paths.values()
 
 
 class SimpleDag(BaseDag):
@@ -833,6 +911,11 @@ class DagFileProcessorManager(LoggingMixin):
         self.base_job = None
         self.file_paths_next_schedule_date = {}
         self.message_watermark = None
+        self._file_path_queue_resident = None
+        self._priority_file_paths = set()
+        self.now = None
+        self._next_can_scheduled_time = None
+        self.file_paths_queue_manager = None
 
         self._log = logging.getLogger('airflow.processor_manager')
 
@@ -876,8 +959,15 @@ class DagFileProcessorManager(LoggingMixin):
         self.dag_file_manager.registry_scheduler()
         if LAZY_SCHEDULE_MODE:
             self.message_watermark = Message.look_for_max_id()
+        if DAG_PROCESSOR_RESIDENT:
+            if not self._async_mode:
+                raise AirflowException("Not support dag processor resident in async mode.")
+            BaseManager.register('FilePathsQueue', FilePathsQueue)
+            self.file_paths_queue_manager = BaseManager()
+            self.file_paths_queue_manager.start()
+            self._file_path_queue_resident = self.file_paths_queue_manager.FilePathsQueue()
+            self._file_paths = set(self._file_paths)
         while True:
-
             if self._signal_conn.poll(poll_time):
                 agent_signal = self._signal_conn.recv()
                 self.log.debug("Received %s signal from DagFileProcessorAgent", agent_signal)
@@ -896,63 +986,183 @@ class DagFileProcessorManager(LoggingMixin):
                 # SQLite DB which isn't a good practice
                 continue
             loop_start_time = time.time()
-            # pylint: enable=no-else-break
-            self._refresh_dag()
-            self._find_zombies()  # pylint: disable=no-value-for-parameter
-
-            self._kill_timed_out_processors()
-            simple_dags = self.collect_results()
-
-            # Generate more file paths to process if we processed all the files
-            # already.
-            if not self._file_path_queue:
-                self.emit_metrics()
-                self.prepare_file_path_queue()
-
-            self.start_new_processes()
-
-            # Update number of loop iteration.
-            self._num_run += 1
-
-            for simple_dag in simple_dags:
-                self._signal_conn.send(simple_dag)
-
-            if not self._async_mode:
-                self.log.debug(
-                    "Waiting for processors to finish since we're using sqlite")
-                # Wait until the running DAG processors are finished before
-                # sending a DagParsingStat message back. This means the Agent
-                # can tell we've got to the end of this iteration when it sees
-                # this type of message
-                self.wait_until_finished()
-
-                # Collect anything else that has finished, but don't kick off any more processors
-                simple_dags = self.collect_results()
+            if DAG_PROCESSOR_RESIDENT:
+                self._refresh_dag_resident_mode()
+                self._find_zombies()
+                simple_dags = self.collect_results_resident_mode()
                 for simple_dag in simple_dags:
                     self._signal_conn.send(simple_dag)
 
-            self._print_stat()
+                self.now = timezone.utcnow()
+                self._next_can_scheduled_time = self.now + self._processor_timeout
+                self._put_priority_path()
+                self._send_file_paths_to_resident_queue()
 
-            all_files_processed = all(self.get_last_finish_time(x) is not None for x in self.file_paths)
-            max_runs_reached = self.max_runs_reached()
+                dag_parsing_stat = DagParsingStat([],
+                                                  False,
+                                                  True,
+                                                  )
+                self._signal_conn.send(dag_parsing_stat)
 
-            dag_parsing_stat = DagParsingStat(self._file_paths,
-                                              max_runs_reached,
-                                              all_files_processed,
-                                              )
-            self._signal_conn.send(dag_parsing_stat)
+            else:
+                # pylint: enable=no-else-break
+                self._refresh_dag()
+                self._find_zombies()  # pylint: disable=no-value-for-parameter
 
-            if max_runs_reached:
-                self.log.info("Exiting dag parsing loop as all files "
-                              "have been processed %s times", self._max_runs)
-                break
+                self._kill_timed_out_processors()
+                simple_dags = self.collect_results()
+
+                # Generate more file paths to process if we processed all the files
+                # already.
+                if not self._file_path_queue:
+                    self.emit_metrics()
+                    self.prepare_file_path_queue()
+
+                self.start_new_processes()
+
+                # Update number of loop iteration.
+                self._num_run += 1
+
+                for simple_dag in simple_dags:
+                    self._signal_conn.send(simple_dag)
+
+                if not self._async_mode:
+                    self.log.debug(
+                        "Waiting for processors to finish since we're using sqlite")
+                    # Wait until the running DAG processors are finished before
+                    # sending a DagParsingStat message back. This means the Agent
+                    # can tell we've got to the end of this iteration when it sees
+                    # this type of message
+                    self.wait_until_finished()
+
+                    # Collect anything else that has finished, but don't kick off any more processors
+                    simple_dags = self.collect_results()
+                    for simple_dag in simple_dags:
+                        self._signal_conn.send(simple_dag)
+
+                    self._print_stat()
+
+                all_files_processed = all(self.get_last_finish_time(x) is not None for x in self.file_paths)
+                max_runs_reached = self.max_runs_reached()
+
+                dag_parsing_stat = DagParsingStat(self._file_paths,
+                                                  max_runs_reached,
+                                                  all_files_processed,
+                                                  )
+                self._signal_conn.send(dag_parsing_stat)
+
+                if max_runs_reached:
+                    self.log.info("Exiting dag parsing loop as all files "
+                                  "have been processed %s times", self._max_runs)
+                    break
 
             if self._async_mode:
                 loop_duration = time.time() - loop_start_time
+                self.log.info(
+                    "Ran scheduling loop in %.2f seconds",
+                    loop_duration)
                 if loop_duration < 1:
                     poll_time = 1 - loop_duration
                 else:
                     poll_time = 0.0
+
+    def _refresh_dag_resident_mode(self):
+        self.dag_file_manager.update_heartbeat()
+        result = self.dag_file_manager.refresh_all_files()
+        if result[0]:
+            self.set_file_paths_resident_mode(result[1])
+        to_release_file_paths = self.dag_file_manager.release_files()
+        self._release_file_paths_resident_mode(to_release_file_paths)
+        to_add_file_paths = self.dag_file_manager.add_files()
+        self._add_file_paths_resident_mode(to_add_file_paths)
+        for file_path in self.get_file_paths_in_message():
+            if file_path in self._file_paths:
+                self._priority_file_paths.add(file_path)
+
+    def set_file_paths_resident_mode(self, new_file_paths):
+        to_add_file_paths = set(new_file_paths) - self._file_paths
+        self._add_file_paths_resident_mode(to_add_file_paths)
+        to_release_file_paths = self._file_paths - set(new_file_paths)
+        self._release_file_paths_resident_mode(to_release_file_paths)
+
+    def _add_file_paths_resident_mode(self, file_paths):
+        if file_paths is None or len(file_paths) == 0:
+            return
+        reset_state_file_paths = []
+        for file_path in file_paths:
+            if file_path not in self._file_paths:
+                reset_state_file_paths.append(file_path)
+                self.file_paths.add(file_path)
+                self.file_paths_next_schedule_date[file_path] = timezone.utcnow()
+                self._priority_file_paths.add(file_path)
+        self.dag_file_manager.reset_state_for_orphaned_tasks(reset_state_file_paths)
+
+    def _release_file_paths_resident_mode(self, file_paths):
+        for file_path in file_paths:
+            if file_path in self._file_paths:
+                self._file_paths.remove(file_path)
+            self.file_paths_next_schedule_date.pop(file_path, None)
+            if file_path in self._priority_file_paths:
+                self._priority_file_paths.remove(file_path)
+            self._file_path_queue_resident.remove(file_path)
+
+    def collect_results_resident_mode(self):
+        self.log.info("Start to collect simple dags.")
+        results = []
+        die_process = []
+        for name, processor in self._processors.items():
+            for result in processor.havest_dags():
+                results.append(result)
+            if self.now - processor.heartbeat > self._processor_timeout:
+                self.log.warning("%s is timeout, last heartbeat in %s", processor.process_name, processor.heartbeat)
+                processor.terminate(havest_dags=True)
+                for result in processor.result:
+                    results.append(result)
+                die_process.append(name)
+        for name in die_process:
+            file_path = self._file_path_queue_resident.finished(name)
+            if file_path is not None:
+                self._priority_file_paths.add(file_path)
+            del self._processors[name]
+        while True:
+            if len(self._processors) < self._parallelism:
+                p = self._processor_factory(self._file_path_queue_resident, self._zombies,
+                                            self._dag_ids, self._pickle_dags)
+                p.start()
+                self.log.info("Start resident dag processor [%s]", p.process_name)
+                self._processors[p.process_name] = p
+            else:
+                break
+        all_simple_dags = []
+        for result in results:
+            simple_dags, found_dag_count, import_errors, file_path, next_schedule_date = result
+            for simple_dag in simple_dags:
+                all_simple_dags.append(simple_dag)
+            if file_path not in self._file_paths:
+                self.log.warning("%s not be scheduled in this node.", file_path)
+                continue
+
+            self.file_paths_next_schedule_date[file_path] = next_schedule_date
+        return all_simple_dags
+
+    def _put_priority_path(self):
+        new_priority_file_paths = set()
+        for file_path in self._priority_file_paths:
+            if self._file_path_queue_resident.add_priority_path(file_path):
+                self.log.info("Send %s to queued.", file_path)
+                self.file_paths_next_schedule_date[file_path] = self._next_can_scheduled_time
+            else:
+                new_priority_file_paths.add(file_path)
+        self._priority_file_paths = new_priority_file_paths
+
+    def _send_file_paths_to_resident_queue(self):
+        queued_size = self._file_path_queue_resident.size()
+        self.log.info("%s file paths queued for processing.", queued_size)
+        if queued_size <= self._parallelism:
+            for file_path, next_scheduled_date in self.file_paths_next_schedule_date.items():
+                if self.now > next_scheduled_date:
+                    self._file_path_queue_resident.lpush(file_path)
+                    self.file_paths_next_schedule_date[file_path] = self._next_can_scheduled_time
 
     def _refresh_dag(self):
         self.dag_file_manager.update_heartbeat()
