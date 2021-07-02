@@ -24,6 +24,43 @@ from random import random # noqa
 import time # noqa
 from . import hive # noqa
 import uuid # noqa
+import calendar
+
+
+def ds_get_date(ds, _type, interval, first_or_last, _format='%Y%m%d'):
+    if _type == "daily":
+        ds = datetime.strptime(ds, '%Y-%m-%d')
+        if interval > 0:
+            ds = ds - timedelta(interval)
+        return ds.strftime(_format)
+    if _type == "weekly":
+        ds = datetime.strptime(ds, '%Y-%m-%d')
+        if interval > 0:
+            ds = ds - timedelta(weeks=interval)
+        one_day = timedelta(days=1)
+        if first_or_last == "first":
+            while ds.weekday() != 0:
+                ds -= one_day
+            return ds.strftime(_format)
+        if first_or_last == "last":
+            while ds.weekday() != 6:
+                ds += one_day
+            return ds.strftime(_format)
+    if _type == "monthly":
+        year_month_dag = ds.split("-")
+        year = int(year_month_dag[0])
+        month = int(year_month_dag[1])
+        while interval > 0:
+            month -= 1
+            if month == 0:
+                month = 12
+                year -= 1
+            interval -= 1
+        if first_or_last == "first":
+            return datetime(year=year, month=month, day=1).strftime(_format)
+        if first_or_last == "last":
+            _, month_days = calendar.monthrange(year, month)
+            return datetime(year=year, month=month, day=month_days).strftime(_format)
 
 
 def ds_add(ds, days):
