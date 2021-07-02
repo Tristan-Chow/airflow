@@ -59,6 +59,8 @@ from airflow.utils.state import State
 from airflow.cluster import get_dag_file_manager
 from airflow.cluster.message import Message, TYPE_FILE_PATH
 from multiprocessing.managers import BaseManager
+from airflow.utils.timeout import timeout
+from airflow.utils.helpers import kill_all_children
 
 if six.PY2:
     ConnectionError = IOError
@@ -968,103 +970,104 @@ class DagFileProcessorManager(LoggingMixin):
             self._file_path_queue_resident = self.file_paths_queue_manager.FilePathsQueue()
             self._file_paths = set(self._file_paths)
         while True:
-            if self._signal_conn.poll(poll_time):
-                agent_signal = self._signal_conn.recv()
-                self.log.debug("Received %s signal from DagFileProcessorAgent", agent_signal)
-                if agent_signal == DagParsingSignal.TERMINATE_MANAGER:
-                    self.terminate()
-                    break
-                elif agent_signal == DagParsingSignal.END_MANAGER:
-                    self.end()
-                    sys.exit(os.EX_OK)
-                elif agent_signal == DagParsingSignal.AGENT_HEARTBEAT:
-                    # continue the loop to parse dags
-                    pass
-            elif not self._async_mode:
-                # In "sync" mode we don't want to parse the DAGs until we
-                # are told to (as that would open another connection to the
-                # SQLite DB which isn't a good practice
-                continue
-            loop_start_time = time.time()
-            if DAG_PROCESSOR_RESIDENT:
-                self._refresh_dag_resident_mode()
-                self._find_zombies()
-                simple_dags = self.collect_results_resident_mode()
-                for simple_dag in simple_dags:
-                    self._signal_conn.send(simple_dag)
-
-                self.now = timezone.utcnow()
-                self._next_can_scheduled_time = self.now + self._processor_timeout
-                self._put_priority_path()
-                self._send_file_paths_to_resident_queue()
-
-                dag_parsing_stat = DagParsingStat([],
-                                                  False,
-                                                  True,
-                                                  )
-                self._signal_conn.send(dag_parsing_stat)
-
-            else:
-                # pylint: enable=no-else-break
-                self._refresh_dag()
-                self._find_zombies()  # pylint: disable=no-value-for-parameter
-
-                self._kill_timed_out_processors()
-                simple_dags = self.collect_results()
-
-                # Generate more file paths to process if we processed all the files
-                # already.
-                if not self._file_path_queue:
-                    self.emit_metrics()
-                    self.prepare_file_path_queue()
-
-                self.start_new_processes()
-
-                # Update number of loop iteration.
-                self._num_run += 1
-
-                for simple_dag in simple_dags:
-                    self._signal_conn.send(simple_dag)
-
-                if not self._async_mode:
-                    self.log.debug(
-                        "Waiting for processors to finish since we're using sqlite")
-                    # Wait until the running DAG processors are finished before
-                    # sending a DagParsingStat message back. This means the Agent
-                    # can tell we've got to the end of this iteration when it sees
-                    # this type of message
-                    self.wait_until_finished()
-
-                    # Collect anything else that has finished, but don't kick off any more processors
-                    simple_dags = self.collect_results()
+            with timeout(seconds=60):
+                if self._signal_conn.poll(poll_time):
+                    agent_signal = self._signal_conn.recv()
+                    self.log.debug("Received %s signal from DagFileProcessorAgent", agent_signal)
+                    if agent_signal == DagParsingSignal.TERMINATE_MANAGER:
+                        self.terminate()
+                        break
+                    elif agent_signal == DagParsingSignal.END_MANAGER:
+                        self.end()
+                        sys.exit(os.EX_OK)
+                    elif agent_signal == DagParsingSignal.AGENT_HEARTBEAT:
+                        # continue the loop to parse dags
+                        pass
+                elif not self._async_mode:
+                    # In "sync" mode we don't want to parse the DAGs until we
+                    # are told to (as that would open another connection to the
+                    # SQLite DB which isn't a good practice
+                    continue
+                loop_start_time = time.time()
+                if DAG_PROCESSOR_RESIDENT:
+                    self._refresh_dag_resident_mode()
+                    self._find_zombies()
+                    simple_dags = self.collect_results_resident_mode()
                     for simple_dag in simple_dags:
                         self._signal_conn.send(simple_dag)
 
-                    self._print_stat()
+                    self.now = timezone.utcnow()
+                    self._next_can_scheduled_time = self.now + self._processor_timeout
+                    self._put_priority_path()
+                    self._send_file_paths_to_resident_queue()
 
-                all_files_processed = all(self.get_last_finish_time(x) is not None for x in self.file_paths)
-                max_runs_reached = self.max_runs_reached()
+                    dag_parsing_stat = DagParsingStat([],
+                                                      False,
+                                                      True,
+                                                      )
+                    self._signal_conn.send(dag_parsing_stat)
 
-                dag_parsing_stat = DagParsingStat(self._file_paths,
-                                                  max_runs_reached,
-                                                  all_files_processed,
-                                                  )
-                self._signal_conn.send(dag_parsing_stat)
-
-                if max_runs_reached:
-                    self.log.info("Exiting dag parsing loop as all files "
-                                  "have been processed %s times", self._max_runs)
-                    break
-
-            if self._async_mode:
-                loop_duration = time.time() - loop_start_time
-                self.log.info(
-                    "Ran scheduling loop in %.2f seconds",
-                    loop_duration)
-                if loop_duration < 1:
-                    poll_time = 1 - loop_duration
                 else:
-                    poll_time = 0.0
+                    # pylint: enable=no-else-break
+                    self._refresh_dag()
+                    self._find_zombies()  # pylint: disable=no-value-for-parameter
+
+                    self._kill_timed_out_processors()
+                    simple_dags = self.collect_results()
+
+                    # Generate more file paths to process if we processed all the files
+                    # already.
+                    if not self._file_path_queue:
+                        self.emit_metrics()
+                        self.prepare_file_path_queue()
+
+                    self.start_new_processes()
+
+                    # Update number of loop iteration.
+                    self._num_run += 1
+
+                    for simple_dag in simple_dags:
+                        self._signal_conn.send(simple_dag)
+
+                    if not self._async_mode:
+                        self.log.debug(
+                            "Waiting for processors to finish since we're using sqlite")
+                        # Wait until the running DAG processors are finished before
+                        # sending a DagParsingStat message back. This means the Agent
+                        # can tell we've got to the end of this iteration when it sees
+                        # this type of message
+                        self.wait_until_finished()
+
+                        # Collect anything else that has finished, but don't kick off any more processors
+                        simple_dags = self.collect_results()
+                        for simple_dag in simple_dags:
+                            self._signal_conn.send(simple_dag)
+
+                        self._print_stat()
+
+                    all_files_processed = all(self.get_last_finish_time(x) is not None for x in self.file_paths)
+                    max_runs_reached = self.max_runs_reached()
+
+                    dag_parsing_stat = DagParsingStat(self._file_paths,
+                                                      max_runs_reached,
+                                                      all_files_processed,
+                                                      )
+                    self._signal_conn.send(dag_parsing_stat)
+
+                    if max_runs_reached:
+                        self.log.info("Exiting dag parsing loop as all files "
+                                      "have been processed %s times", self._max_runs)
+                        break
+
+                if self._async_mode:
+                    loop_duration = time.time() - loop_start_time
+                    self.log.info(
+                        "Ran scheduling loop in %.2f seconds",
+                        loop_duration)
+                    if loop_duration < 1:
+                        poll_time = 1 - loop_duration
+                    else:
+                        poll_time = 0.0
 
     def _refresh_dag_resident_mode(self):
         self.dag_file_manager.update_heartbeat()
@@ -1628,6 +1631,7 @@ class DagFileProcessorManager(LoggingMixin):
         for processor in self._processors.values():
             Stats.decr('dag_processing.processes')
             processor.terminate()
+        kill_all_children(self.log)
 
     def end(self):
         """

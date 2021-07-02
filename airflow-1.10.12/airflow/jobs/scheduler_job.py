@@ -67,6 +67,8 @@ from airflow.cluster.nodeinstance import NodeInstance, INSTANCE_SCHEDULER_LEADER
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.models import TaskReschedule
 from airflow.cluster.message import add_file_path as add_file_path_to_message
+from airflow.utils.timeout import timeout
+from airflow.utils.helpers import kill_all_children
 
 
 class ResidentDagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingStartMethodMixin):
@@ -707,6 +709,7 @@ class SchedulerJob(BaseJob):
         self.log.info("Exiting gracefully upon receiving signal %s", signum)
         if self.processor_agent:
             self.processor_agent.end()
+        kill_all_children(self.log, recursive=True)
         sys.exit(os.EX_OK)
 
     def is_alive(self, grace_multiplier=None):
@@ -2247,65 +2250,92 @@ class SchedulerJob(BaseJob):
         # Last time that self.heartbeat() was called.
         last_self_heartbeat_time = timezone.utcnow()
 
+        self.try_number = 1
+        self.loop_count = 0
+        self.reset_try_number = False
+
         # For the execute duration, parse and schedule DAGs
         while (timezone.utcnow() - execute_start_time).total_seconds() < \
                 self.run_duration or self.run_duration < 0:
-            self.log.debug("Starting Loop...")
-            loop_start_time = time.time()
+            try:
+                with timeout(seconds=60):
+                    self.log.debug("Starting Loop...")
+                    loop_start_time = time.time()
 
-            if self.using_sqlite:
-                self.processor_agent.heartbeat()
-                # For the sqlite case w/ 1 thread, wait until the processor
-                # is finished to avoid concurrent access to the DB.
-                self.log.debug(
-                    "Waiting for processors to finish since we're using sqlite")
-                self.processor_agent.wait_until_finished()
+                    if self.using_sqlite:
+                        self.processor_agent.heartbeat()
+                        # For the sqlite case w/ 1 thread, wait until the processor
+                        # is finished to avoid concurrent access to the DB.
+                        self.log.debug(
+                            "Waiting for processors to finish since we're using sqlite")
+                        self.processor_agent.wait_until_finished()
 
-            self.log.debug("Harvesting DAG parsing results")
-            simple_dags = self._get_simple_dags()
-            self.log.debug("Harvested {} SimpleDAGs".format(len(simple_dags)))
+                    self.log.debug("Harvesting DAG parsing results")
+                    simple_dags = self._get_simple_dags()
+                    self.log.debug("Harvested {} SimpleDAGs".format(len(simple_dags)))
 
-            # Send tasks for execution if available
-            simple_dag_bag = SimpleDagBag(simple_dags)
+                    # Send tasks for execution if available
+                    simple_dag_bag = SimpleDagBag(simple_dags)
 
-            if settings.GLOBAL_SCHEDULE_MODE:
-                self.registry_or_update_heartbeat()
-                if self.is_leader:
-                    if not self._validate_and_run_task_instances_by_orm():
+                    if settings.GLOBAL_SCHEDULE_MODE:
+                        self.registry_or_update_heartbeat()
+                        if self.is_leader:
+                            if not self._validate_and_run_task_instances_by_orm():
+                                continue
+                    elif not self._validate_and_run_task_instances(simple_dag_bag=simple_dag_bag):
                         continue
-            elif not self._validate_and_run_task_instances(simple_dag_bag=simple_dag_bag):
-                continue
 
-            # Heartbeat the scheduler periodically
-            time_since_last_heartbeat = (timezone.utcnow() -
-                                         last_self_heartbeat_time).total_seconds()
-            if time_since_last_heartbeat > self.heartrate:
-                self.log.debug("Heartbeating the scheduler")
-                self.heartbeat()
-                last_self_heartbeat_time = timezone.utcnow()
+                    # Heartbeat the scheduler periodically
+                    time_since_last_heartbeat = (timezone.utcnow() -
+                                                 last_self_heartbeat_time).total_seconds()
+                    if time_since_last_heartbeat > self.heartrate:
+                        self.log.debug("Heartbeating the scheduler")
+                        self.heartbeat()
+                        last_self_heartbeat_time = timezone.utcnow()
 
-            is_unit_test = conf.getboolean('core', 'unit_test_mode')
-            loop_end_time = time.time()
-            loop_duration = loop_end_time - loop_start_time
-            self.log.info(
-                "Ran scheduling loop in %.2f seconds",
-                loop_duration)
+                    is_unit_test = conf.getboolean('core', 'unit_test_mode')
+                    loop_end_time = time.time()
+                    loop_duration = loop_end_time - loop_start_time
+                    self.log.info(
+                        "Ran scheduling loop in %.2f seconds",
+                        loop_duration)
 
-            if not is_unit_test:
-                self.log.debug("Sleeping for %.2f seconds", self._processor_poll_interval)
-                time.sleep(self._processor_poll_interval)
+                    if not is_unit_test:
+                        self.log.debug("Sleeping for %.2f seconds", self._processor_poll_interval)
+                        time.sleep(self._processor_poll_interval)
 
-            if self.processor_agent.done:
-                self.log.info("Exiting scheduler loop as all files"
-                              " have been processed {} times".format(self.num_runs))
-                break
+                    if self.processor_agent.done:
+                        self.log.info("Exiting scheduler loop as all files"
+                                      " have been processed {} times".format(self.num_runs))
+                        break
 
-            if loop_duration < 1 and not is_unit_test:
-                sleep_length = 1 - loop_duration
-                self.log.debug(
-                    "Sleeping for {0:.2f} seconds to prevent excessive logging"
-                    .format(sleep_length))
-                sleep(sleep_length)
+                    if loop_duration < 1 and not is_unit_test:
+                        sleep_length = 1 - loop_duration
+                        self.log.debug(
+                            "Sleeping for {0:.2f} seconds to prevent excessive logging"
+                            .format(sleep_length))
+                        sleep(sleep_length)
+
+                    if self.reset_try_number:
+                        if self.loop_count > 100:
+                            self.try_number = 1
+                            self.log.info("Reset loop try_number.")
+                            self.reset_try_number = False
+                        else:
+                            self.loop_count += 1
+            except Exception as e:
+                self.log.error(
+                    "execute_helper exception:%s\n%s\n", e, traceback.format_exc()
+                )
+                settings.configure_orm(dispose_last_orm=True)
+                self.try_number += 1
+                self.loop_count = 0
+                self.reset_try_number = True
+                if self.try_number > 3:
+                    self.log.error("Try_number is {}. raise error.".format(self.try_number))
+                    kill_all_children(self.log, recursive=True)
+                    raise e
+                self._get_simple_dags()
 
         # Stop any processors
         self.processor_agent.terminate()
@@ -2323,6 +2353,7 @@ class SchedulerJob(BaseJob):
         self.executor.end()
 
         settings.Session.remove()
+        kill_all_children(self.log, recursive=True)
 
     def _validate_and_run_task_instances(self, simple_dag_bag):
         if len(simple_dag_bag.simple_dags) > 0:
